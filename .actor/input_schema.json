@@ -1,0 +1,53 @@
+{
+  "title": "Mobile.de Vehicle Scraper",
+  "description": "Extract vehicle listings from Mobile.de search pages with pagination support.",
+  "type": "object",
+  "schemaVersion": 1,
+  "properties": {
+    "startUrl": {
+      "title": "Start URL",
+      "type": "string",
+      "description": "Mobile.de search URL. If provided, it is used directly.",
+      "editor": "textfield",
+      "prefill": "https://suchen.mobile.de/fahrzeuge/search.html?dam=false&isSearchRequest=true&ms=3500%3B%3B%3B&ref=homeAISearch&s=Car&userInput=bmw&vc=Car"
+    },
+    "keyword": {
+      "title": "Keyword",
+      "type": "string",
+      "description": "Search keyword used when Start URL is not provided.",
+      "editor": "textfield",
+      "prefill": "bmw"
+    },
+    "results_wanted": {
+      "title": "Maximum number of listings",
+      "type": "integer",
+      "description": "Maximum number of listings to collect.",
+      "minimum": 1,
+      "default": 20,
+      "prefill": 20,
+      "editor": "number",
+      "example": 20
+    },
+    "max_pages": {
+      "title": "Maximum number of pages",
+      "type": "integer",
+      "description": "Safety cap on paginated search result pages.",
+      "minimum": 1,
+      "editor": "number",
+      "default": 3,
+      "prefill": 3,
+      "example": 3
+    },
+    "proxyConfiguration": {
+      "title": "Proxy configuration",
+      "type": "object",
+      "description": "Use Apify Proxy for better reliability.",
+      "editor": "proxy",
+      "default": {
+        "useApifyProxy": true
+      }
+    }
+  },
+  "required": [],
+  "additionalProperties": false
+}

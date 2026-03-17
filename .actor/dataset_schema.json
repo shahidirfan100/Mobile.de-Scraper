@@ -1,0 +1,113 @@
+{
+  "actorSpecification": 1,
+  "fields": {},
+  "views": {
+    "overview": {
+      "title": "Overview",
+      "transformation": {
+        "fields": [
+          "listing_id",
+          "title",
+          "make",
+          "model",
+          "price_eur",
+          "power_ps",
+          "first_registration",
+          "mileage_km",
+          "fuel_type",
+          "transmission",
+          "seller_name",
+          "seller_type",
+          "seller_rating_score",
+          "collected_images_count",
+          "images_count",
+          "image_url",
+          "city",
+          "url",
+          "page_number"
+        ]
+      },
+      "display": {
+        "component": "table",
+        "properties": {
+          "listing_id": {
+            "label": "Listing ID",
+            "format": "number"
+          },
+          "title": {
+            "label": "Title",
+            "format": "text"
+          },
+          "make": {
+            "label": "Make",
+            "format": "text"
+          },
+          "model": {
+            "label": "Model",
+            "format": "text"
+          },
+          "price_eur": {
+            "label": "Price",
+            "format": "number"
+          },
+          "power_ps": {
+            "label": "Power (PS)",
+            "format": "number"
+          },
+          "first_registration": {
+            "label": "First Registration",
+            "format": "text"
+          },
+          "mileage_km": {
+            "label": "Mileage",
+            "format": "number"
+          },
+          "fuel_type": {
+            "label": "Fuel",
+            "format": "text"
+          },
+          "transmission": {
+            "label": "Transmission",
+            "format": "text"
+          },
+          "seller_name": {
+            "label": "Seller",
+            "format": "text"
+          },
+          "seller_type": {
+            "label": "Seller Type",
+            "format": "text"
+          },
+          "seller_rating_score": {
+            "label": "Seller Rating",
+            "format": "number"
+          },
+          "collected_images_count": {
+            "label": "Collected Images",
+            "format": "number"
+          },
+          "images_count": {
+            "label": "Image Count",
+            "format": "number"
+          },
+          "image_url": {
+            "label": "Primary Image",
+            "format": "image"
+          },
+          "city": {
+            "label": "City",
+            "format": "text"
+          },
+          "url": {
+            "label": "URL",
+            "format": "link"
+          },
+          "page_number": {
+            "label": "Page",
+            "format": "number"
+          }
+        }
+      }
+    }
+  }
+}
