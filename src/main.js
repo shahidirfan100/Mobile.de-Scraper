@@ -204,6 +204,25 @@ const toMobileHostUrl = (rawUrl) => {
     return url.toString();
 };
 
+const toConsumerApiUrl = (rawSearchUrl, endpointPath) => {
+    const searchUrl = new URL(rawSearchUrl);
+    const apiUrl = new URL(`https://m.mobile.de/consumer/api/${endpointPath}`);
+    for (const [key, value] of searchUrl.searchParams.entries()) {
+        apiUrl.searchParams.set(key, value);
+    }
+    return apiUrl.toString();
+};
+
+const wrapSearchResultsState = (searchResults) => ({
+    search: {
+        srp: {
+            data: {
+                searchResults,
+            },
+        },
+    },
+});
+
 const toListingUrl = (relativeUrl, listingId) => {
     const numericId = maybeInteger(listingId);
     if (numericId) {
@@ -293,6 +312,68 @@ const isValidMappedRecord = (record) => {
     );
 };
 
+const fetchSearchStateViaApi = async ({ searchUrl, proxyConfiguration, maxAttempts }) => {
+    const attempts = [
+        {
+            mode: 'consumer-api-srp',
+            url: toConsumerApiUrl(searchUrl, 'search/srp'),
+            parseResults: (payload) => payload?.searchResults,
+        },
+        {
+            mode: 'consumer-api-items',
+            url: toConsumerApiUrl(searchUrl, 'search/srp/items'),
+            parseResults: (payload) => {
+                if (!Array.isArray(payload?.items)) return null;
+                return {
+                    items: payload.items,
+                    hasNextPage: payload.hasNextPage,
+                    searchId: payload.searchId,
+                };
+            },
+        },
+    ];
+    let lastError;
+
+    for (const target of attempts) {
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                const proxyUrl = proxyConfiguration ? await proxyConfiguration.newUrl() : undefined;
+                const response = await gotScraping.get(target.url, {
+                    proxyUrl,
+                    timeout: { request: 45000 },
+                    headers: {
+                        'user-agent': DESKTOP_USER_AGENT,
+                        accept: 'application/json,text/plain,*/*',
+                        'accept-language': 'en-US,en;q=0.9,de;q=0.8',
+                        'cache-control': 'no-cache',
+                        pragma: 'no-cache',
+                        referer: 'https://m.mobile.de/',
+                        'x-requested-with': 'XMLHttpRequest',
+                    },
+                });
+
+                const payload = JSON.parse(response.body);
+                const searchResults = target.parseResults(payload);
+                if (searchResults && Array.isArray(searchResults.items)) {
+                    return {
+                        state: wrapSearchResultsState(searchResults),
+                        mode: target.mode,
+                    };
+                }
+                lastError = new Error(`No parsable JSON search results on ${target.mode} response (attempt ${attempt}/${maxAttempts}).`);
+            } catch (error) {
+                lastError = error;
+            }
+
+            if (attempt < maxAttempts) {
+                await sleep(700 + Math.floor(Math.random() * 900));
+            }
+        }
+    }
+
+    throw new Error(`Unable to fetch a valid API search response: ${searchUrl}. ${lastError?.message || ''}`.trim());
+};
+
 const fetchSearchState = async ({ searchUrl, proxyConfiguration, maxAttempts }) => {
     const attempts = [
         { mode: 'desktop', url: searchUrl, userAgent: DESKTOP_USER_AGENT },
@@ -333,6 +414,16 @@ const fetchSearchState = async ({ searchUrl, proxyConfiguration, maxAttempts }) 
         }
     }
 
+    try {
+        return await fetchSearchStateViaApi({
+            searchUrl,
+            proxyConfiguration,
+            maxAttempts,
+        });
+    } catch (error) {
+        lastError = error;
+    }
+
     throw new Error(`Unable to fetch a valid search page: ${searchUrl}. ${lastError?.message || ''}`.trim());
 };
 
@@ -362,9 +453,15 @@ await Actor.main(async () => {
         ? normalizeSearchUrl(startUrl)
         : buildSearchUrlFromKeyword({ keyword });
 
-    const proxyConfiguration = proxyConfigInput
-        ? await Actor.createProxyConfiguration(proxyConfigInput)
+    const shouldUseDefaultProxy = !proxyConfigInput && Actor.isAtHome();
+    const effectiveProxyConfig = proxyConfigInput || (shouldUseDefaultProxy ? { useApifyProxy: true } : undefined);
+    const proxyConfiguration = effectiveProxyConfig
+        ? await Actor.createProxyConfiguration(effectiveProxyConfig)
         : undefined;
+
+    if (shouldUseDefaultProxy) {
+        log.info('No proxyConfiguration input received, defaulting to Apify Proxy.');
+    }
 
     log.info(`Starting Mobile.de scrape (target ${resultsWanted} listings, max ${maxPages} pages).`);
 
@@ -402,7 +499,8 @@ await Actor.main(async () => {
         const searchId = searchResults.searchId;
 
         discoveredTotalPages = toPositiveInt(searchResults.numPages, discoveredTotalPages);
-        log.info(`Parsed ${items.length} listings from page ${pageNumber}${mode === 'mobile-fallback' ? ' (fallback mode)' : ''}.`);
+        const modeLabel = mode && mode !== 'desktop' ? ` (${mode})` : '';
+        log.info(`Parsed ${items.length} listings from page ${pageNumber}${modeLabel}.`);
 
         if (!items.length) break;
 
