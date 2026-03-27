@@ -167,6 +167,158 @@ const extractInitialState = (html) => {
     return null;
 };
 
+const parseJsonSafely = (raw) => {
+    if (typeof raw !== 'string') return null;
+    try {
+        return JSON.parse(raw);
+    } catch {
+        return null;
+    }
+};
+
+const extractBalancedJson = (source, startIndex) => {
+    if (typeof source !== 'string') return null;
+    const opening = source[startIndex];
+    const closing = opening === '{' ? '}' : opening === '[' ? ']' : null;
+    if (!closing) return null;
+
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+
+    for (let i = startIndex; i < source.length; i++) {
+        const char = source[i];
+
+        if (inString) {
+            if (escaped) escaped = false;
+            else if (char === '\\') escaped = true;
+            else if (char === '"') inString = false;
+            continue;
+        }
+
+        if (char === '"') {
+            inString = true;
+            continue;
+        }
+        if (char === opening) depth++;
+        if (char === closing) {
+            depth--;
+            if (depth === 0) return source.slice(startIndex, i + 1);
+        }
+    }
+
+    return null;
+};
+
+const isSearchResultsObject = (value) => {
+    if (!value || typeof value !== 'object' || !Array.isArray(value.items)) return false;
+    if (value.items.length === 0) return true;
+
+    return value.items.some((item) => isRealListingItem(item)
+        || (item && typeof item === 'object' && Array.isArray(item.items)));
+};
+
+const findSearchResultsInNode = (root) => {
+    if (!root || typeof root !== 'object') return null;
+
+    const queue = [root];
+    const visited = new WeakSet();
+
+    while (queue.length) {
+        const node = queue.shift();
+        if (!node || typeof node !== 'object' || visited.has(node)) continue;
+        visited.add(node);
+
+        if (isSearchResultsObject(node)) return node;
+
+        const nestedSearchResults = node?.search?.srp?.data?.searchResults;
+        if (isSearchResultsObject(nestedSearchResults)) return nestedSearchResults;
+
+        if (isSearchResultsObject(node.searchResults)) return node.searchResults;
+
+        if (Array.isArray(node)) {
+            for (const child of node) {
+                if (child && typeof child === 'object') queue.push(child);
+            }
+            continue;
+        }
+
+        for (const child of Object.values(node)) {
+            if (child && typeof child === 'object') queue.push(child);
+        }
+    }
+
+    return null;
+};
+
+const extractSearchResultsFromHtml = (html) => {
+    if (typeof html !== 'string' || !html.trim()) return null;
+
+    const initialState = extractInitialState(html);
+    const initialStateSearchResults = findSearchResultsInNode(initialState);
+    if (initialStateSearchResults) return initialStateSearchResults;
+
+    const nextDataMatch = html.match(/<script[^>]*id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i);
+    const nextData = parseJsonSafely(nextDataMatch?.[1]?.trim());
+    const nextDataSearchResults = findSearchResultsInNode(nextData);
+    if (nextDataSearchResults) return nextDataSearchResults;
+
+    const markerRegex = /["']searchResults["']\s*:\s*/g;
+    let markerMatch;
+    while ((markerMatch = markerRegex.exec(html)) !== null) {
+        let cursor = markerMatch.index + markerMatch[0].length;
+        while (cursor < html.length && /\s/.test(html[cursor])) cursor++;
+        if (html[cursor] !== '{') continue;
+
+        const jsonFragment = extractBalancedJson(html, cursor);
+        const candidate = parseJsonSafely(jsonFragment);
+        if (isSearchResultsObject(candidate)) return candidate;
+
+        const nestedSearchResults = findSearchResultsInNode(candidate);
+        if (nestedSearchResults) return nestedSearchResults;
+    }
+
+    const scriptRegex = /<script\b[^>]*>([\s\S]*?)<\/script>/gi;
+    let scriptMatch;
+    while ((scriptMatch = scriptRegex.exec(html)) !== null) {
+        const scriptContent = scriptMatch[1]?.trim();
+        if (!scriptContent) continue;
+
+        if (scriptContent.startsWith('{') || scriptContent.startsWith('[')) {
+            const parsedScript = parseJsonSafely(scriptContent);
+            const parsedScriptSearchResults = findSearchResultsInNode(parsedScript);
+            if (parsedScriptSearchResults) return parsedScriptSearchResults;
+            continue;
+        }
+
+        const markers = ['window.__INITIAL_STATE__', 'window.__PRELOADED_STATE__', 'window.__NEXT_DATA__'];
+        for (const marker of markers) {
+            const markerIndex = scriptContent.indexOf(marker);
+            if (markerIndex < 0) continue;
+
+            const equalsIndex = scriptContent.indexOf('=', markerIndex + marker.length);
+            if (equalsIndex < 0) continue;
+
+            let valueStart = equalsIndex + 1;
+            while (valueStart < scriptContent.length && /\s/.test(scriptContent[valueStart])) valueStart++;
+            if (scriptContent[valueStart] !== '{' && scriptContent[valueStart] !== '[') continue;
+
+            const jsonFragment = extractBalancedJson(scriptContent, valueStart);
+            const parsedScript = parseJsonSafely(jsonFragment);
+            const parsedScriptSearchResults = findSearchResultsInNode(parsedScript);
+            if (parsedScriptSearchResults) return parsedScriptSearchResults;
+        }
+    }
+
+    return null;
+};
+
+const isLikelyHtml = (body) => {
+    if (typeof body !== 'string') return false;
+    const sample = body.slice(0, 2000).toLowerCase();
+    return sample.includes('<!doctype html') || sample.includes('<html') || sample.includes('<head') || sample.includes('<body');
+};
+
 const buildSearchUrlFromKeyword = ({ keyword }) => {
     const normalizedKeyword = typeof keyword === 'string' ? keyword.trim() : '';
     if (!normalizedKeyword) {
@@ -335,38 +487,61 @@ const fetchSearchStateViaApi = async ({ searchUrl, proxyConfiguration, maxAttemp
     let lastError;
 
     for (const target of attempts) {
-        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-            try {
-                const proxyUrl = proxyConfiguration ? await proxyConfiguration.newUrl() : undefined;
-                const response = await gotScraping.get(target.url, {
-                    proxyUrl,
-                    timeout: { request: 45000 },
-                    headers: {
-                        'user-agent': DESKTOP_USER_AGENT,
-                        accept: 'application/json,text/plain,*/*',
-                        'accept-language': 'en-US,en;q=0.9,de;q=0.8',
-                        'cache-control': 'no-cache',
-                        pragma: 'no-cache',
-                        referer: 'https://m.mobile.de/',
-                        'x-requested-with': 'XMLHttpRequest',
-                    },
-                });
+        const proxyModes = proxyConfiguration ? ['proxy', 'direct'] : ['direct'];
 
-                const payload = JSON.parse(response.body);
-                const searchResults = target.parseResults(payload);
-                if (searchResults && Array.isArray(searchResults.items)) {
-                    return {
-                        state: wrapSearchResultsState(searchResults),
-                        mode: target.mode,
-                    };
+        for (const proxyMode of proxyModes) {
+            for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+                try {
+                    const proxyUrl = proxyMode === 'proxy' ? await proxyConfiguration.newUrl() : undefined;
+                    const response = await gotScraping.get(target.url, {
+                        proxyUrl,
+                        timeout: { request: 45000 },
+                        headers: {
+                            'user-agent': DESKTOP_USER_AGENT,
+                            accept: 'application/json,text/plain,*/*',
+                            'accept-language': 'en-US,en;q=0.9,de;q=0.8',
+                            'cache-control': 'no-cache',
+                            pragma: 'no-cache',
+                            referer: searchUrl,
+                            'x-requested-with': 'XMLHttpRequest',
+                        },
+                    });
+
+                    const body = typeof response.body === 'string' ? response.body : '';
+                    const contentType = String(response.headers?.['content-type'] || '').toLowerCase();
+                    const trimmedBody = body.trimStart();
+
+                    let searchResults = null;
+                    if (trimmedBody.startsWith('{') || trimmedBody.startsWith('[') || contentType.includes('json')) {
+                        const payload = parseJsonSafely(body);
+                        if (payload) {
+                            searchResults = target.parseResults(payload) || findSearchResultsInNode(payload);
+                        }
+                    }
+
+                    if (!searchResults && isLikelyHtml(body)) {
+                        searchResults = extractSearchResultsFromHtml(body);
+                    }
+
+                    if (searchResults && Array.isArray(searchResults.items)) {
+                        const modeSuffix = proxyMode === 'proxy' ? '' : '-direct';
+                        return {
+                            state: wrapSearchResultsState(searchResults),
+                            mode: `${target.mode}${modeSuffix}`,
+                        };
+                    }
+
+                    const sample = body.slice(0, 140).replace(/\s+/g, ' ').trim();
+                    lastError = new Error(
+                        `No parsable search results on ${target.mode} (${proxyMode}) response (attempt ${attempt}/${maxAttempts}, status ${response.statusCode}${contentType ? `, ${contentType}` : ''}${sample ? `, sample: ${sample}` : ''}).`,
+                    );
+                } catch (error) {
+                    lastError = error;
                 }
-                lastError = new Error(`No parsable JSON search results on ${target.mode} response (attempt ${attempt}/${maxAttempts}).`);
-            } catch (error) {
-                lastError = error;
-            }
 
-            if (attempt < maxAttempts) {
-                await sleep(700 + Math.floor(Math.random() * 900));
+                if (attempt < maxAttempts) {
+                    await sleep(700 + Math.floor(Math.random() * 900));
+                }
             }
         }
     }
@@ -382,34 +557,47 @@ const fetchSearchState = async ({ searchUrl, proxyConfiguration, maxAttempts }) 
     let lastError;
 
     for (const target of attempts) {
-        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-            try {
-                const proxyUrl = proxyConfiguration ? await proxyConfiguration.newUrl() : undefined;
-                const response = await gotScraping.get(target.url, {
-                    proxyUrl,
-                    timeout: { request: 45000 },
-                    headers: {
-                        'user-agent': target.userAgent,
-                        accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                        'accept-language': 'en-US,en;q=0.9,de;q=0.8',
-                        'cache-control': 'no-cache',
-                        pragma: 'no-cache',
-                        referer: 'https://www.mobile.de/',
-                    },
-                });
+        const proxyModes = proxyConfiguration ? ['proxy', 'direct'] : ['direct'];
 
-                const state = extractInitialState(response.body);
-                const searchResults = state?.search?.srp?.data?.searchResults;
-                if (searchResults && Array.isArray(searchResults.items)) {
-                    return { state, mode: target.mode };
+        for (const proxyMode of proxyModes) {
+            for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+                try {
+                    const proxyUrl = proxyMode === 'proxy' ? await proxyConfiguration.newUrl() : undefined;
+                    const response = await gotScraping.get(target.url, {
+                        proxyUrl,
+                        timeout: { request: 45000 },
+                        headers: {
+                            'user-agent': target.userAgent,
+                            accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                            'accept-language': 'en-US,en;q=0.9,de;q=0.8',
+                            'cache-control': 'no-cache',
+                            pragma: 'no-cache',
+                            referer: 'https://www.mobile.de/',
+                        },
+                    });
+
+                    const searchResults = extractSearchResultsFromHtml(response.body);
+                    if (searchResults && Array.isArray(searchResults.items)) {
+                        const modeSuffix = proxyMode === 'proxy' ? '' : '-direct';
+                        return {
+                            state: wrapSearchResultsState(searchResults),
+                            mode: `${target.mode}${modeSuffix}`,
+                        };
+                    }
+
+                    const body = typeof response.body === 'string' ? response.body : '';
+                    const contentType = String(response.headers?.['content-type'] || '').toLowerCase();
+                    const sample = body.slice(0, 140).replace(/\s+/g, ' ').trim();
+                    lastError = new Error(
+                        `No parsable state on ${target.mode} (${proxyMode}) response (attempt ${attempt}/${maxAttempts}, status ${response.statusCode}${contentType ? `, ${contentType}` : ''}${sample ? `, sample: ${sample}` : ''}).`,
+                    );
+                } catch (error) {
+                    lastError = error;
                 }
-                lastError = new Error(`No parsable state on ${target.mode} response (attempt ${attempt}/${maxAttempts}).`);
-            } catch (error) {
-                lastError = error;
-            }
 
-            if (attempt < maxAttempts) {
-                await sleep(700 + Math.floor(Math.random() * 900));
+                if (attempt < maxAttempts) {
+                    await sleep(700 + Math.floor(Math.random() * 900));
+                }
             }
         }
     }
