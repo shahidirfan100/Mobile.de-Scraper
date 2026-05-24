@@ -5,8 +5,8 @@ Extract vehicle listing data from Mobile.de search result pages at scale. Collec
 ## Features
 
 - **Search URL support** - Start directly from a prepared Mobile.de search URL.
-- **Keyword-based search** - Build a search from keyword when no start URL is provided.
 - **Pagination handling** - Automatically collects across multiple result pages.
+- **Auto-healing retries** - Tries alternate search strategies when a page returns no usable listings.
 - **Clean output records** - Removes null and empty values from dataset items.
 - **Rich listing details** - Includes pricing, specs, seller profile, full image URL list, and metadata.
 
@@ -31,7 +31,6 @@ Create datasets for analytics, dashboards, and reporting pipelines. Export clean
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `startUrl` | String | No | Mobile.de BMW search URL | Mobile.de search URL to scrape directly. |
-| `keyword` | String | No | `"bmw"` | Search keyword used when `startUrl` is not provided. |
 | `results_wanted` | Integer | No | `20` | Maximum number of listings to collect. |
 | `max_pages` | Integer | No | `3` | Maximum number of pages to process. |
 | `proxyConfiguration` | Object | No | `{"useApifyProxy": true}` | Proxy setup for improved reliability. |
@@ -80,11 +79,10 @@ Each dataset item contains listing details such as:
 }
 ```
 
-### Keyword-Based Collection
+### Extended Pagination Run
 
 ```json
 {
-    "keyword": "bmw",
     "results_wanted": 50,
     "max_pages": 5
 }

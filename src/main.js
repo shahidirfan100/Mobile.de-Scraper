@@ -1,13 +1,91 @@
-import { Actor, log } from 'apify';
 import { readFile } from 'node:fs/promises';
+
+import { Actor, log } from 'apify';
 import { gotScraping } from 'got-scraping';
 
 const DESKTOP_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0';
 const MOBILE_USER_AGENT = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Mobile/15E148 Safari/604.1';
+const FAIL_ON_EMPTY_RESULTS_INTERNAL = false;
+const START_URL_ALLOWED_HOST_SUFFIX = 'mobile.de';
+const MAX_RESULTS_WANTED = 2000;
+const MAX_PAGES = 50;
+const USE_SECONDARY_CANDIDATES_WHEN_PARTIAL = false;
 
 const toPositiveInt = (value, fallback) => {
     const n = Number(value);
     return Number.isInteger(n) && n > 0 ? n : fallback;
+};
+
+const clampInt = (value, minValue, maxValue) => Math.min(Math.max(value, minValue), maxValue);
+
+const isAllowedStartUrlHost = (hostname) => {
+    if (typeof hostname !== 'string' || !hostname.trim()) return false;
+    const normalized = hostname.trim().toLowerCase();
+    return normalized === START_URL_ALLOWED_HOST_SUFFIX || normalized.endsWith(`.${START_URL_ALLOWED_HOST_SUFFIX}`);
+};
+
+const makeSoftWarningPayload = ({ warning, warnings = [], startUrl, resultsWanted, maxPages }) => ({
+    warning,
+    hints: [
+        'Try enabling Apify Proxy with residential groups.',
+        'Try a broader startUrl.',
+        'Retry later in case of temporary anti-bot challenge.',
+    ],
+    warnings: warnings.slice(-10),
+    inputSummary: {
+        hasStartUrl: Boolean(startUrl),
+        resultsWanted,
+        maxPages,
+    },
+    generatedAt: new Date().toISOString(),
+});
+
+const persistSoftWarning = async (payload) => {
+    try {
+        await Actor.setValue('SOFT_WARNING', payload);
+    } catch (error) {
+        log.warning(`Failed to persist SOFT_WARNING: ${error.message}`);
+    }
+};
+
+const tryDecodeUrlText = (value) => {
+    if (typeof value !== 'string') return value;
+    try {
+        return decodeURIComponent(value);
+    } catch {
+        return value;
+    }
+};
+
+const parseInputUrlLoosely = (rawUrl) => {
+    if (typeof rawUrl !== 'string') return null;
+    const trimmed = rawUrl.trim();
+    if (!trimmed) return null;
+
+    const variants = [trimmed, tryDecodeUrlText(trimmed)];
+    const seen = new Set();
+
+    for (const variant of variants) {
+        if (typeof variant !== 'string') continue;
+        const candidate = variant.trim();
+        if (!candidate) continue;
+
+        const prefixed = /^[a-zA-Z][a-zA-Z\d+.-]*:/.test(candidate)
+            ? [candidate]
+            : [`https://${candidate.replace(/^\/+/, '')}`, `https:${candidate}`];
+
+        for (const attempt of prefixed) {
+            if (!attempt || seen.has(attempt)) continue;
+            seen.add(attempt);
+            try {
+                return new URL(attempt);
+            } catch {
+                // continue trying other variants
+            }
+        }
+    }
+
+    return null;
 };
 
 const loadFallbackInput = async () => {
@@ -20,9 +98,12 @@ const loadFallbackInput = async () => {
     }
 };
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const sleep = (ms) => new Promise((resolve) => {
+    setTimeout(resolve, ms);
+});
 
 const maybeNumber = (value) => {
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
     if (typeof value !== 'string') return undefined;
     const normalized = value.replace(/\s/g, '').replace(/\./g, '').replace(',', '.').replace(/[^\d.-]/g, '');
     if (!normalized) return undefined;
@@ -83,18 +164,28 @@ const collectImageUrls = (item) => {
 };
 
 const collectListingsFromNodes = (nodes, out = []) => {
-    if (!Array.isArray(nodes)) return out;
+    const queue = Array.isArray(nodes) ? [...nodes] : [nodes];
+    const visited = new WeakSet();
 
-    for (const node of nodes) {
-        if (!node || typeof node !== 'object') continue;
+    while (queue.length) {
+        const node = queue.shift();
+        if (!node || typeof node !== 'object' || visited.has(node)) continue;
+        visited.add(node);
 
         if (isRealListingItem(node)) {
             out.push(node);
             continue;
         }
 
-        if (Array.isArray(node.items)) {
-            collectListingsFromNodes(node.items, out);
+        if (Array.isArray(node)) {
+            for (const child of node) {
+                if (child && typeof child === 'object') queue.push(child);
+            }
+            continue;
+        }
+
+        for (const value of Object.values(node)) {
+            if (value && typeof value === 'object') queue.push(value);
         }
     }
 
@@ -179,7 +270,9 @@ const parseJsonSafely = (raw) => {
 const extractBalancedJson = (source, startIndex) => {
     if (typeof source !== 'string') return null;
     const opening = source[startIndex];
-    const closing = opening === '{' ? '}' : opening === '[' ? ']' : null;
+    let closing = null;
+    if (opening === '{') closing = '}';
+    else if (opening === '[') closing = ']';
     if (!closing) return null;
 
     let depth = 0;
@@ -264,8 +357,10 @@ const extractSearchResultsFromHtml = (html) => {
     if (nextDataSearchResults) return nextDataSearchResults;
 
     const markerRegex = /["']searchResults["']\s*:\s*/g;
-    let markerMatch;
-    while ((markerMatch = markerRegex.exec(html)) !== null) {
+    while (true) {
+        const markerMatch = markerRegex.exec(html);
+        if (markerMatch === null) break;
+
         let cursor = markerMatch.index + markerMatch[0].length;
         while (cursor < html.length && /\s/.test(html[cursor])) cursor++;
         if (html[cursor] !== '{') continue;
@@ -279,8 +374,10 @@ const extractSearchResultsFromHtml = (html) => {
     }
 
     const scriptRegex = /<script\b[^>]*>([\s\S]*?)<\/script>/gi;
-    let scriptMatch;
-    while ((scriptMatch = scriptRegex.exec(html)) !== null) {
+    while (true) {
+        const scriptMatch = scriptRegex.exec(html);
+        if (scriptMatch === null) break;
+
         const scriptContent = scriptMatch[1]?.trim();
         if (!scriptContent) continue;
 
@@ -319,10 +416,26 @@ const isLikelyHtml = (body) => {
     return sample.includes('<!doctype html') || sample.includes('<html') || sample.includes('<head') || sample.includes('<body');
 };
 
+const isLikelyBlockedResponse = ({ body, statusCode }) => {
+    const text = typeof body === 'string' ? body.toLowerCase() : '';
+    if (statusCode === 403 || statusCode === 429) return true;
+    if (!text) return false;
+    const markers = [
+        'access denied',
+        'forbidden',
+        'captcha',
+        'verify you are human',
+        'security check',
+        'bot challenge',
+        'too many requests',
+    ];
+    return markers.some((marker) => text.includes(marker));
+};
+
 const buildSearchUrlFromKeyword = ({ keyword }) => {
     const normalizedKeyword = typeof keyword === 'string' ? keyword.trim() : '';
     if (!normalizedKeyword) {
-        throw new Error('Provide either "startUrl" or "keyword".');
+        throw new Error('No valid fallback search term found in startUrl.');
     }
 
     const url = new URL('https://suchen.mobile.de/fahrzeuge/search.html');
@@ -338,10 +451,76 @@ const buildSearchUrlFromKeyword = ({ keyword }) => {
 
 const normalizeSearchUrl = (rawUrl) => {
     const url = new URL(rawUrl);
+    url.protocol = 'https:';
     url.searchParams.set('isSearchRequest', 'true');
     if (!url.searchParams.has('s')) url.searchParams.set('s', 'Car');
     if (!url.searchParams.has('vc')) url.searchParams.set('vc', 'Car');
     return url.toString();
+};
+
+const extractKeywordFromSearchUrl = (rawUrl) => {
+    const parsed = parseInputUrlLoosely(rawUrl);
+    if (parsed) {
+        const value = parsed.searchParams.get('userInput')
+            || parsed.searchParams.get('q')
+            || parsed.searchParams.get('query')
+            || parsed.searchParams.get('keyword')
+            || '';
+        const normalized = value.trim();
+        if (normalized) return normalized;
+    }
+
+    if (typeof rawUrl !== 'string') return undefined;
+    const decoded = tryDecodeUrlText(rawUrl);
+    const match = decoded.match(/[?&#](?:userInput|q|query|keyword)=([^&#]+)/i);
+    if (!match?.[1]) return undefined;
+    const normalized = tryDecodeUrlText(match[1]).replace(/\+/g, ' ').trim();
+    return normalized || undefined;
+};
+
+const buildBaseSearchUrlCandidates = ({ startUrl }) => {
+    const candidates = [];
+    const seen = new Set();
+    const add = (url, source) => {
+        if (typeof url !== 'string') return;
+        const trimmed = url.trim();
+        if (!trimmed || seen.has(trimmed)) return;
+        seen.add(trimmed);
+        candidates.push({ url: trimmed, source });
+    };
+
+    if (typeof startUrl === 'string' && startUrl.trim()) {
+        const parsedStartUrl = parseInputUrlLoosely(startUrl);
+        if (!parsedStartUrl) {
+            log.warning(`Invalid startUrl provided. Ignoring: ${startUrl}`);
+        } else if (!isAllowedStartUrlHost(parsedStartUrl.hostname)) {
+            log.warning(`Ignoring startUrl with non-mobile.de host: ${parsedStartUrl.hostname}`);
+        } else {
+            add(normalizeSearchUrl(parsedStartUrl.toString()), 'startUrl');
+        }
+    }
+
+    const keywords = [];
+    const addKeyword = (value) => {
+        if (typeof value !== 'string') return;
+        const normalized = value.trim();
+        if (normalized && !keywords.includes(normalized)) keywords.push(normalized);
+    };
+    addKeyword(startUrl ? extractKeywordFromSearchUrl(startUrl) : undefined);
+
+    for (const candidateKeyword of keywords) {
+        try {
+            add(buildSearchUrlFromKeyword({ keyword: candidateKeyword }), 'keyword');
+        } catch {
+            // ignored
+        }
+    }
+
+    if (!candidates.length) {
+        throw new Error('No valid search URL candidate could be generated from startUrl.');
+    }
+
+    return candidates;
 };
 
 const withPageNumber = (rawUrl, pageNumber) => {
@@ -356,13 +535,17 @@ const toMobileHostUrl = (rawUrl) => {
     return url.toString();
 };
 
-const toConsumerApiUrl = (rawSearchUrl, endpointPath) => {
+const toConsumerApiUrls = (rawSearchUrl, endpointPath) => {
     const searchUrl = new URL(rawSearchUrl);
-    const apiUrl = new URL(`https://m.mobile.de/consumer/api/${endpointPath}`);
-    for (const [key, value] of searchUrl.searchParams.entries()) {
-        apiUrl.searchParams.set(key, value);
-    }
-    return apiUrl.toString();
+    const hosts = ['m.mobile.de', 'www.mobile.de'];
+
+    return hosts.map((host) => {
+        const apiUrl = new URL(`https://${host}/consumer/api/${endpointPath}`);
+        for (const [key, value] of searchUrl.searchParams.entries()) {
+            apiUrl.searchParams.set(key, value);
+        }
+        return apiUrl.toString();
+    });
 };
 
 const wrapSearchResultsState = (searchResults) => ({
@@ -468,12 +651,12 @@ const fetchSearchStateViaApi = async ({ searchUrl, proxyConfiguration, maxAttemp
     const attempts = [
         {
             mode: 'consumer-api-srp',
-            url: toConsumerApiUrl(searchUrl, 'search/srp'),
+            endpointPath: 'search/srp',
             parseResults: (payload) => payload?.searchResults,
         },
         {
             mode: 'consumer-api-items',
-            url: toConsumerApiUrl(searchUrl, 'search/srp/items'),
+            endpointPath: 'search/srp/items',
             parseResults: (payload) => {
                 if (!Array.isArray(payload?.items)) return null;
                 return {
@@ -487,60 +670,72 @@ const fetchSearchStateViaApi = async ({ searchUrl, proxyConfiguration, maxAttemp
     let lastError;
 
     for (const target of attempts) {
-        const proxyModes = proxyConfiguration ? ['proxy', 'direct'] : ['direct'];
+        const candidateApiUrls = toConsumerApiUrls(searchUrl, target.endpointPath);
+        for (const apiUrl of candidateApiUrls) {
+            const apiHost = new URL(apiUrl).hostname;
+            const proxyModes = proxyConfiguration ? ['proxy', 'direct'] : ['direct'];
 
-        for (const proxyMode of proxyModes) {
-            for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-                try {
-                    const proxyUrl = proxyMode === 'proxy' ? await proxyConfiguration.newUrl() : undefined;
-                    const response = await gotScraping.get(target.url, {
-                        proxyUrl,
-                        timeout: { request: 45000 },
-                        headers: {
-                            'user-agent': DESKTOP_USER_AGENT,
-                            accept: 'application/json,text/plain,*/*',
-                            'accept-language': 'en-US,en;q=0.9,de;q=0.8',
-                            'cache-control': 'no-cache',
-                            pragma: 'no-cache',
-                            referer: searchUrl,
-                            'x-requested-with': 'XMLHttpRequest',
-                        },
-                    });
+            for (const proxyMode of proxyModes) {
+                for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+                    try {
+                        const proxyUrl = proxyMode === 'proxy' ? await proxyConfiguration.newUrl() : undefined;
+                        const response = await gotScraping.get(apiUrl, {
+                            proxyUrl,
+                            timeout: { request: 45000 },
+                            headers: {
+                                'user-agent': DESKTOP_USER_AGENT,
+                                accept: 'application/json,text/plain,*/*',
+                                'accept-language': 'en-US,en;q=0.9,de;q=0.8',
+                                'cache-control': 'no-cache',
+                                pragma: 'no-cache',
+                                referer: searchUrl,
+                                'x-requested-with': 'XMLHttpRequest',
+                            },
+                        });
 
-                    const body = typeof response.body === 'string' ? response.body : '';
-                    const contentType = String(response.headers?.['content-type'] || '').toLowerCase();
-                    const trimmedBody = body.trimStart();
+                        const body = typeof response.body === 'string' ? response.body : '';
+                        const contentType = String(response.headers?.['content-type'] || '').toLowerCase();
+                        const trimmedBody = body.trimStart();
 
-                    let searchResults = null;
-                    if (trimmedBody.startsWith('{') || trimmedBody.startsWith('[') || contentType.includes('json')) {
-                        const payload = parseJsonSafely(body);
-                        if (payload) {
-                            searchResults = target.parseResults(payload) || findSearchResultsInNode(payload);
+                        if (isLikelyBlockedResponse({ body, statusCode: response.statusCode })) {
+                            const sample = body.slice(0, 140).replace(/\s+/g, ' ').trim();
+                            lastError = new Error(
+                                `Blocked/challenge response on ${target.mode}:${apiHost} (${proxyMode}) (attempt ${attempt}/${maxAttempts}, status ${response.statusCode}${sample ? `, sample: ${sample}` : ''}).`,
+                            );
+                            continue;
                         }
+
+                        let searchResults = null;
+                        if (trimmedBody.startsWith('{') || trimmedBody.startsWith('[') || contentType.includes('json')) {
+                            const payload = parseJsonSafely(body);
+                            if (payload) {
+                                searchResults = target.parseResults(payload) || findSearchResultsInNode(payload);
+                            }
+                        }
+
+                        if (!searchResults && isLikelyHtml(body)) {
+                            searchResults = extractSearchResultsFromHtml(body);
+                        }
+
+                        if (searchResults && Array.isArray(searchResults.items)) {
+                            const modeSuffix = proxyMode === 'proxy' ? '' : '-direct';
+                            return {
+                                state: wrapSearchResultsState(searchResults),
+                                mode: `${target.mode}-${apiHost}${modeSuffix}`,
+                            };
+                        }
+
+                        const sample = body.slice(0, 140).replace(/\s+/g, ' ').trim();
+                        lastError = new Error(
+                            `No parsable search results on ${target.mode}:${apiHost} (${proxyMode}) response (attempt ${attempt}/${maxAttempts}, status ${response.statusCode}${contentType ? `, ${contentType}` : ''}${sample ? `, sample: ${sample}` : ''}).`,
+                        );
+                    } catch (error) {
+                        lastError = error;
                     }
 
-                    if (!searchResults && isLikelyHtml(body)) {
-                        searchResults = extractSearchResultsFromHtml(body);
+                    if (attempt < maxAttempts) {
+                        await sleep(250 + Math.floor(Math.random() * 300));
                     }
-
-                    if (searchResults && Array.isArray(searchResults.items)) {
-                        const modeSuffix = proxyMode === 'proxy' ? '' : '-direct';
-                        return {
-                            state: wrapSearchResultsState(searchResults),
-                            mode: `${target.mode}${modeSuffix}`,
-                        };
-                    }
-
-                    const sample = body.slice(0, 140).replace(/\s+/g, ' ').trim();
-                    lastError = new Error(
-                        `No parsable search results on ${target.mode} (${proxyMode}) response (attempt ${attempt}/${maxAttempts}, status ${response.statusCode}${contentType ? `, ${contentType}` : ''}${sample ? `, sample: ${sample}` : ''}).`,
-                    );
-                } catch (error) {
-                    lastError = error;
-                }
-
-                if (attempt < maxAttempts) {
-                    await sleep(700 + Math.floor(Math.random() * 900));
                 }
             }
         }
@@ -549,7 +744,26 @@ const fetchSearchStateViaApi = async ({ searchUrl, proxyConfiguration, maxAttemp
     throw new Error(`Unable to fetch a valid API search response: ${searchUrl}. ${lastError?.message || ''}`.trim());
 };
 
-const fetchSearchState = async ({ searchUrl, proxyConfiguration, maxAttempts }) => {
+const fetchSearchState = async ({
+    searchUrl,
+    proxyConfiguration,
+    maxAttempts,
+    preferApiFirst = true,
+}) => {
+    const tryApi = async () => fetchSearchStateViaApi({
+        searchUrl,
+        proxyConfiguration,
+        maxAttempts,
+    });
+
+    if (preferApiFirst) {
+        try {
+            return await tryApi();
+        } catch {
+            // API-first failed, continue with HTML fallback modes
+        }
+    }
+
     const attempts = [
         { mode: 'desktop', url: searchUrl, userAgent: DESKTOP_USER_AGENT },
         { mode: 'mobile-fallback', url: toMobileHostUrl(searchUrl), userAgent: MOBILE_USER_AGENT },
@@ -576,6 +790,15 @@ const fetchSearchState = async ({ searchUrl, proxyConfiguration, maxAttempts }) 
                         },
                     });
 
+                    if (isLikelyBlockedResponse({ body: response.body, statusCode: response.statusCode })) {
+                        const body = typeof response.body === 'string' ? response.body : '';
+                        const sample = body.slice(0, 140).replace(/\s+/g, ' ').trim();
+                        lastError = new Error(
+                            `Blocked/challenge page on ${target.mode} (${proxyMode}) response (attempt ${attempt}/${maxAttempts}, status ${response.statusCode}${sample ? `, sample: ${sample}` : ''}).`,
+                        );
+                        continue;
+                    }
+
                     const searchResults = extractSearchResultsFromHtml(response.body);
                     if (searchResults && Array.isArray(searchResults.items)) {
                         const modeSuffix = proxyMode === 'proxy' ? '' : '-direct';
@@ -596,20 +819,18 @@ const fetchSearchState = async ({ searchUrl, proxyConfiguration, maxAttempts }) 
                 }
 
                 if (attempt < maxAttempts) {
-                    await sleep(700 + Math.floor(Math.random() * 900));
+                    await sleep(250 + Math.floor(Math.random() * 300));
                 }
             }
         }
     }
 
-    try {
-        return await fetchSearchStateViaApi({
-            searchUrl,
-            proxyConfiguration,
-            maxAttempts,
-        });
-    } catch (error) {
-        lastError = error;
+    if (!preferApiFirst) {
+        try {
+            return await tryApi();
+        } catch (error) {
+            lastError = error;
+        }
     }
 
     throw new Error(`Unable to fetch a valid search page: ${searchUrl}. ${lastError?.message || ''}`.trim());
@@ -623,106 +844,165 @@ await Actor.main(async () => {
     const input = { ...fallbackInput, ...actorInputObject };
 
     if (!actorInputKeys.length) {
-        log.info('No Actor input received, using INPUT.json fallback.');
+        // INPUT.json fallback is intentional for local/dev runs.
     }
     const {
         startUrl,
-        keyword,
-        results_wanted = 20,
-        max_pages = 3,
+        results_wanted: resultsWantedInput = 20,
+        max_pages: maxPagesInput = 3,
         proxyConfiguration: proxyConfigInput,
     } = input;
 
-    const resultsWanted = toPositiveInt(results_wanted, 20);
-    const maxPages = toPositiveInt(max_pages, 3);
-    const fetchAttempts = 3;
-
-    const baseSearchUrl = startUrl
-        ? normalizeSearchUrl(startUrl)
-        : buildSearchUrlFromKeyword({ keyword });
-
-    const shouldUseDefaultProxy = !proxyConfigInput && Actor.isAtHome();
-    const effectiveProxyConfig = proxyConfigInput || (shouldUseDefaultProxy ? { useApifyProxy: true } : undefined);
-    const proxyConfiguration = effectiveProxyConfig
-        ? await Actor.createProxyConfiguration(effectiveProxyConfig)
-        : undefined;
-
-    if (shouldUseDefaultProxy) {
-        log.info('No proxyConfiguration input received, defaulting to Apify Proxy.');
+    const resultsWanted = clampInt(toPositiveInt(resultsWantedInput, 20), 1, MAX_RESULTS_WANTED);
+    const maxPages = clampInt(toPositiveInt(maxPagesInput, 3), 1, MAX_PAGES);
+    const fetchAttempts = 2;
+    let baseSearchCandidates;
+    try {
+        baseSearchCandidates = buildBaseSearchUrlCandidates({ startUrl });
+    } catch (error) {
+        const warningMessage = `Input normalization failed: ${error.message}`;
+        log.warning(warningMessage);
+        await persistSoftWarning(makeSoftWarningPayload({
+            warning: warningMessage,
+            startUrl,
+            resultsWanted,
+            maxPages,
+        }));
+        return;
     }
 
-    log.info(`Starting Mobile.de scrape (target ${resultsWanted} listings, max ${maxPages} pages).`);
+    const runWarnings = [];
+    const shouldUseDefaultProxy = !proxyConfigInput && Actor.isAtHome();
+    const effectiveProxyConfig = proxyConfigInput || (shouldUseDefaultProxy ? { useApifyProxy: true } : undefined);
+    let proxyConfiguration;
+    if (effectiveProxyConfig) {
+        try {
+            proxyConfiguration = await Actor.createProxyConfiguration(effectiveProxyConfig);
+        } catch (error) {
+            const warning = `Proxy initialization failed, continuing without proxy: ${error.message}`;
+            runWarnings.push(warning);
+            log.warning(warning);
+            proxyConfiguration = undefined;
+        }
+    }
+
+    if (shouldUseDefaultProxy) {
+        // Keep quiet here; ProxyConfiguration itself emits useful warnings when misconfigured.
+    }
 
     let totalSaved = 0;
     const seenIds = new Set();
-    let discoveredTotalPages = Number.POSITIVE_INFINITY;
 
-    for (let pageNumber = 1; pageNumber <= maxPages && pageNumber <= discoveredTotalPages; pageNumber++) {
+    for (let candidateIndex = 0; candidateIndex < baseSearchCandidates.length; candidateIndex++) {
         if (totalSaved >= resultsWanted) break;
 
-        const searchUrl = withPageNumber(baseSearchUrl, pageNumber);
-        log.info(`Fetching page ${pageNumber}: ${searchUrl}`);
+        const candidate = baseSearchCandidates[candidateIndex];
+        let discoveredTotalPages = Number.POSITIVE_INFINITY;
+        let savedByCandidate = 0;
+        const candidateLabel = `${candidateIndex + 1}/${baseSearchCandidates.length}`;
+        let preferApiFirst = candidate.source !== 'keyword';
+        let lowYieldPagesInRow = 0;
 
-        let state;
-        let mode;
-        try {
-            const fetched = await fetchSearchState({
-                searchUrl,
-                proxyConfiguration,
-                maxAttempts: fetchAttempts,
-            });
-            state = fetched.state;
-            mode = fetched.mode;
-        } catch (error) {
-            if (totalSaved > 0) {
-                log.warning(`Stopping pagination early on page ${pageNumber}: ${error.message}`);
+        for (let pageNumber = 1; pageNumber <= maxPages && pageNumber <= discoveredTotalPages; pageNumber++) {
+            if (totalSaved >= resultsWanted) break;
+
+            const searchUrl = withPageNumber(candidate.url, pageNumber);
+
+            let state;
+            try {
+                const fetched = await fetchSearchState({
+                    searchUrl,
+                    proxyConfiguration,
+                    maxAttempts: fetchAttempts,
+                    preferApiFirst,
+                });
+                state = fetched.state;
+            } catch (error) {
+                const warning = `Page fetch failed for candidate ${candidateLabel} page ${pageNumber}: ${error.message}`;
+                runWarnings.push(warning);
+                log.warning(warning);
                 break;
             }
-            throw error;
+
+            const searchResults = state?.search?.srp?.data?.searchResults || {};
+            const rawItems = Array.isArray(searchResults.items) ? searchResults.items : [];
+            const items = collectListingsFromNodes(rawItems);
+            const {searchId} = searchResults;
+
+            discoveredTotalPages = toPositiveInt(searchResults.numPages, discoveredTotalPages);
+            if (!items.length) {
+                const warning = `No listings parsed for candidate ${candidateLabel} page ${pageNumber}; switching strategy if available.`;
+                runWarnings.push(warning);
+                log.warning(warning);
+                break;
+            }
+
+            const pageBatch = [];
+            for (const item of items) {
+                if (totalSaved + pageBatch.length >= resultsWanted) break;
+
+                const dedupeKey = item?.id ?? item?.relativeUrl ?? `${candidateIndex + 1}-${pageNumber}-${totalSaved + pageBatch.length}`;
+                if (seenIds.has(dedupeKey)) continue;
+
+                const mapped = mapSearchItem({
+                    item,
+                    pageNumber,
+                    searchId,
+                });
+
+                if (!isValidMappedRecord(mapped)) continue;
+
+                seenIds.add(dedupeKey);
+                pageBatch.push(mapped);
+            }
+
+            if (pageBatch.length) {
+                await Actor.pushData(pageBatch);
+                totalSaved += pageBatch.length;
+                savedByCandidate += pageBatch.length;
+                log.info(`Saved ${pageBatch.length} listings from page ${pageNumber}. Total: ${totalSaved}/${resultsWanted}`);
+            }
+
+            if (items.length >= 20 && pageBatch.length <= 5) {
+                lowYieldPagesInRow++;
+            } else {
+                lowYieldPagesInRow = 0;
+            }
+
+            if (preferApiFirst && lowYieldPagesInRow >= 2) {
+                preferApiFirst = false;
+            }
+
+            if (searchResults.hasNextPage === false) break;
         }
 
-        const searchResults = state?.search?.srp?.data?.searchResults || {};
-        const rawItems = Array.isArray(searchResults.items) ? searchResults.items : [];
-        const items = collectListingsFromNodes(rawItems);
-        const searchId = searchResults.searchId;
-
-        discoveredTotalPages = toPositiveInt(searchResults.numPages, discoveredTotalPages);
-        const modeLabel = mode && mode !== 'desktop' ? ` (${mode})` : '';
-        log.info(`Parsed ${items.length} listings from page ${pageNumber}${modeLabel}.`);
-
-        if (!items.length) break;
-
-        const pageBatch = [];
-        for (const item of items) {
-            if (totalSaved + pageBatch.length >= resultsWanted) break;
-
-            const dedupeKey = item?.id ?? item?.relativeUrl ?? `${pageNumber}-${totalSaved + pageBatch.length}`;
-            if (seenIds.has(dedupeKey)) continue;
-
-            const mapped = mapSearchItem({
-                item,
-                pageNumber,
-                searchId,
-            });
-
-            if (!isValidMappedRecord(mapped)) continue;
-
-            seenIds.add(dedupeKey);
-            pageBatch.push(mapped);
+        if (savedByCandidate === 0 && candidateIndex < baseSearchCandidates.length - 1) {
+            log.warning(`Candidate ${candidateLabel} produced no listings. Trying next candidate.`);
+            continue;
         }
 
-        if (pageBatch.length) {
-            await Actor.pushData(pageBatch);
-            totalSaved += pageBatch.length;
-            log.info(`Saved ${pageBatch.length} listings from page ${pageNumber}. Total: ${totalSaved}/${resultsWanted}`);
+        if (savedByCandidate > 0 && !USE_SECONDARY_CANDIDATES_WHEN_PARTIAL) {
+            break;
         }
-
-        if (searchResults.hasNextPage === false) break;
-        await sleep(600 + Math.floor(Math.random() * 900));
     }
 
     if (!totalSaved) {
-        throw new Error('No listings were extracted. Try enabling Apify Proxy or adjust the search URL.');
+        const warningMessage = 'No listings were extracted after all auto-healing strategies. Try enabling Apify Proxy or adjust the search URL.';
+        if (FAIL_ON_EMPTY_RESULTS_INTERNAL) {
+            throw new Error(warningMessage);
+        }
+        log.warning(warningMessage);
+        await persistSoftWarning(makeSoftWarningPayload({
+            warning: warningMessage,
+            warnings: runWarnings,
+            startUrl,
+            resultsWanted,
+            maxPages,
+        }));
+        return;
     }
-    log.info(`Finished. Total saved: ${totalSaved}.`);
+
+    if (runWarnings.length) {
+        log.warning(`Completed with ${runWarnings.length} warning(s). Last warning: ${runWarnings[runWarnings.length - 1]}`);
+    }
 });

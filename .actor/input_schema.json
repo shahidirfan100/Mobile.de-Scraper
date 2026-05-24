@@ -11,13 +11,6 @@
       "editor": "textfield",
       "prefill": "https://suchen.mobile.de/fahrzeuge/search.html?dam=false&isSearchRequest=true&ms=3500%3B%3B%3B&ref=homeAISearch&s=Car&userInput=bmw&vc=Car"
     },
-    "keyword": {
-      "title": "Keyword",
-      "type": "string",
-      "description": "Search keyword used when Start URL is not provided.",
-      "editor": "textfield",
-      "prefill": "bmw"
-    },
     "results_wanted": {
       "title": "Maximum number of listings",
       "type": "integer",

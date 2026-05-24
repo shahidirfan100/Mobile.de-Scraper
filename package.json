@@ -4,7 +4,7 @@
   "description": "Extract vehicle listings from Mobile.de search result pages.",
   "type": "module",
   "dependencies": {
-    "apify": "^3.6.0",
+    "apify": "^3.7.2",
     "got-scraping": "^4.2.1"
   },
   "scripts": {
@@ -16,5 +16,11 @@
     "test": "echo \"No tests specified\""
   },
   "author": "Shahid Irfan",
-  "license": "ISC"
+  "license": "ISC",
+  "devDependencies": {
+    "@apify/eslint-config": "1.0.0",
+    "eslint": "9.29.0",
+    "eslint-config-prettier": "10.1.5",
+    "prettier": "3.5.3"
+  }
 }
