@@ -3,6 +3,6 @@
   "results_wanted": 20,
   "max_pages": 3,
   "proxyConfiguration": {
-    "useApifyProxy": true
+    "useApifyProxy": false
   }
 }
