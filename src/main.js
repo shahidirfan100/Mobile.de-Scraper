@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 
 import { Actor, log } from 'apify';
-import { gotScraping } from 'got-scraping';
+import { Impit } from 'impit';
 
 const DESKTOP_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0';
 const MOBILE_USER_AGENT = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Mobile/15E148 Safari/604.1';
@@ -101,6 +101,12 @@ const loadFallbackInput = async () => {
 const sleep = (ms) => new Promise((resolve) => {
     setTimeout(resolve, ms);
 });
+
+const calculateBackoffMs = (attempt, statusCode) => {
+    if (statusCode === 429) return Math.min(3000 * attempt, 30000);
+    if (statusCode === 403 || (statusCode >= 500 && statusCode < 600)) return Math.min(2000 * attempt, 15000);
+    return 250 * attempt + Math.floor(Math.random() * 300);
+};
 
 const maybeNumber = (value) => {
     if (typeof value === 'number' && Number.isFinite(value)) return value;
@@ -216,11 +222,10 @@ const compactValue = (value) => {
 };
 
 const extractInitialState = (html) => {
-    const marker = 'window.__INITIAL_STATE__ = ';
-    const startIndex = html.indexOf(marker);
-    if (startIndex < 0) return null;
+    const markerMatch = html.match(/window\.__INITIAL_STATE__\s*=\s*/i);
+    if (!markerMatch) return null;
 
-    let jsonStart = startIndex + marker.length;
+    let jsonStart = markerMatch.index + markerMatch[0].length;
     while (jsonStart < html.length && /\s/.test(html[jsonStart])) jsonStart++;
     if (html[jsonStart] !== '{') return null;
 
@@ -388,12 +393,13 @@ const extractSearchResultsFromHtml = (html) => {
             continue;
         }
 
-        const markers = ['window.__INITIAL_STATE__', 'window.__PRELOADED_STATE__', 'window.__NEXT_DATA__'];
+        const markers = ['window.__init_state__', 'window.__preloaded_state__', 'window.__next_data__'];
+        const lowerScript = scriptContent.toLowerCase();
         for (const marker of markers) {
-            const markerIndex = scriptContent.indexOf(marker);
+            const markerIndex = lowerScript.indexOf(marker);
             if (markerIndex < 0) continue;
 
-            const equalsIndex = scriptContent.indexOf('=', markerIndex + marker.length);
+            const equalsIndex = scriptContent.indexOf('=', markerIndex);
             if (equalsIndex < 0) continue;
 
             let valueStart = equalsIndex + 1;
@@ -450,12 +456,16 @@ const buildSearchUrlFromKeyword = ({ keyword }) => {
 };
 
 const normalizeSearchUrl = (rawUrl) => {
-    const url = new URL(rawUrl);
-    url.protocol = 'https:';
-    url.searchParams.set('isSearchRequest', 'true');
-    if (!url.searchParams.has('s')) url.searchParams.set('s', 'Car');
-    if (!url.searchParams.has('vc')) url.searchParams.set('vc', 'Car');
-    return url.toString();
+    try {
+        const url = new URL(rawUrl);
+        url.protocol = 'https:';
+        url.searchParams.set('isSearchRequest', 'true');
+        if (!url.searchParams.has('s')) url.searchParams.set('s', 'Car');
+        if (!url.searchParams.has('vc')) url.searchParams.set('vc', 'Car');
+        return url.toString();
+    } catch {
+        return rawUrl;
+    }
 };
 
 const extractKeywordFromSearchUrl = (rawUrl) => {
@@ -668,20 +678,23 @@ const fetchSearchStateViaApi = async ({ searchUrl, proxyConfiguration, maxAttemp
         },
     ];
     let lastError;
+    let lastStatusCode;
+    const proxyModes = proxyConfiguration ? ['proxy', 'direct'] : ['direct'];
 
-    for (const target of attempts) {
-        const candidateApiUrls = toConsumerApiUrls(searchUrl, target.endpointPath);
-        for (const apiUrl of candidateApiUrls) {
-            const apiHost = new URL(apiUrl).hostname;
-            const proxyModes = proxyConfiguration ? ['proxy', 'direct'] : ['direct'];
+    for (const proxyMode of proxyModes) {
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            const proxyUrl = proxyMode === 'proxy' ? await proxyConfiguration.newUrl() : undefined;
+            const impit = proxyUrl
+                ? new Impit({ browser: 'chrome', http3: true, ignoreTlsErrors: true, proxyUrl })
+                : new Impit({ browser: 'chrome', http3: true, ignoreTlsErrors: true });
 
-            for (const proxyMode of proxyModes) {
-                for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            for (const target of attempts) {
+                const candidateApiUrls = toConsumerApiUrls(searchUrl, target.endpointPath);
+                for (const apiUrl of candidateApiUrls) {
+                    const apiHost = new URL(apiUrl).hostname;
                     try {
-                        const proxyUrl = proxyMode === 'proxy' ? await proxyConfiguration.newUrl() : undefined;
-                        const response = await gotScraping.get(apiUrl, {
-                            proxyUrl,
-                            timeout: { request: 45000 },
+                        const response = await impit.fetch(apiUrl, {
+                            signal: AbortSignal.timeout(45000),
                             headers: {
                                 'user-agent': DESKTOP_USER_AGENT,
                                 accept: 'application/json,text/plain,*/*',
@@ -693,14 +706,15 @@ const fetchSearchStateViaApi = async ({ searchUrl, proxyConfiguration, maxAttemp
                             },
                         });
 
-                        const body = typeof response.body === 'string' ? response.body : '';
-                        const contentType = String(response.headers?.['content-type'] || '').toLowerCase();
+                        const body = await response.text();
+                        const contentType = String(response.headers.get('content-type') || '').toLowerCase();
                         const trimmedBody = body.trimStart();
 
-                        if (isLikelyBlockedResponse({ body, statusCode: response.statusCode })) {
+                        lastStatusCode = response.status;
+                        if (isLikelyBlockedResponse({ body, statusCode: response.status })) {
                             const sample = body.slice(0, 140).replace(/\s+/g, ' ').trim();
                             lastError = new Error(
-                                `Blocked/challenge response on ${target.mode}:${apiHost} (${proxyMode}) (attempt ${attempt}/${maxAttempts}, status ${response.statusCode}${sample ? `, sample: ${sample}` : ''}).`,
+                                `Blocked/challenge response on ${target.mode}:${apiHost} (${proxyMode}) (attempt ${attempt}/${maxAttempts}, status ${response.status}${sample ? `, sample: ${sample}` : ''}).`,
                             );
                             continue;
                         }
@@ -727,16 +741,17 @@ const fetchSearchStateViaApi = async ({ searchUrl, proxyConfiguration, maxAttemp
 
                         const sample = body.slice(0, 140).replace(/\s+/g, ' ').trim();
                         lastError = new Error(
-                            `No parsable search results on ${target.mode}:${apiHost} (${proxyMode}) response (attempt ${attempt}/${maxAttempts}, status ${response.statusCode}${contentType ? `, ${contentType}` : ''}${sample ? `, sample: ${sample}` : ''}).`,
+                            `No parsable search results on ${target.mode}:${apiHost} (${proxyMode}) response (attempt ${attempt}/${maxAttempts}, status ${response.status}${contentType ? `, ${contentType}` : ''}${sample ? `, sample: ${sample}` : ''}).`,
                         );
                     } catch (error) {
                         lastError = error;
-                    }
-
-                    if (attempt < maxAttempts) {
-                        await sleep(250 + Math.floor(Math.random() * 300));
+                        lastStatusCode = undefined;
                     }
                 }
+            }
+
+            if (attempt < maxAttempts) {
+                await sleep(calculateBackoffMs(attempt, lastStatusCode));
             }
         }
     }
@@ -769,17 +784,20 @@ const fetchSearchState = async ({
         { mode: 'mobile-fallback', url: toMobileHostUrl(searchUrl), userAgent: MOBILE_USER_AGENT },
     ];
     let lastError;
+    let lastStatusCode;
+    const proxyModes = proxyConfiguration ? ['proxy', 'direct'] : ['direct'];
 
-    for (const target of attempts) {
-        const proxyModes = proxyConfiguration ? ['proxy', 'direct'] : ['direct'];
+    for (const proxyMode of proxyModes) {
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            const proxyUrl = proxyMode === 'proxy' ? await proxyConfiguration.newUrl() : undefined;
+            const impit = proxyUrl
+                ? new Impit({ browser: 'chrome', http3: true, ignoreTlsErrors: true, proxyUrl })
+                : new Impit({ browser: 'chrome', http3: true, ignoreTlsErrors: true });
 
-        for (const proxyMode of proxyModes) {
-            for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            for (const target of attempts) {
                 try {
-                    const proxyUrl = proxyMode === 'proxy' ? await proxyConfiguration.newUrl() : undefined;
-                    const response = await gotScraping.get(target.url, {
-                        proxyUrl,
-                        timeout: { request: 45000 },
+                    const response = await impit.fetch(target.url, {
+                        signal: AbortSignal.timeout(45000),
                         headers: {
                             'user-agent': target.userAgent,
                             accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -790,16 +808,18 @@ const fetchSearchState = async ({
                         },
                     });
 
-                    if (isLikelyBlockedResponse({ body: response.body, statusCode: response.statusCode })) {
-                        const body = typeof response.body === 'string' ? response.body : '';
-                        const sample = body.slice(0, 140).replace(/\s+/g, ' ').trim();
+                    const respBodyText = await response.text();
+                    lastStatusCode = response.status;
+
+                    if (isLikelyBlockedResponse({ body: respBodyText, statusCode: response.status })) {
+                        const sample = respBodyText.slice(0, 140).replace(/\s+/g, ' ').trim();
                         lastError = new Error(
-                            `Blocked/challenge page on ${target.mode} (${proxyMode}) response (attempt ${attempt}/${maxAttempts}, status ${response.statusCode}${sample ? `, sample: ${sample}` : ''}).`,
+                            `Blocked/challenge page on ${target.mode} (${proxyMode}) response (attempt ${attempt}/${maxAttempts}, status ${response.status}${sample ? `, sample: ${sample}` : ''}).`,
                         );
                         continue;
                     }
 
-                    const searchResults = extractSearchResultsFromHtml(response.body);
+                    const searchResults = extractSearchResultsFromHtml(respBodyText);
                     if (searchResults && Array.isArray(searchResults.items)) {
                         const modeSuffix = proxyMode === 'proxy' ? '' : '-direct';
                         return {
@@ -808,19 +828,19 @@ const fetchSearchState = async ({
                         };
                     }
 
-                    const body = typeof response.body === 'string' ? response.body : '';
-                    const contentType = String(response.headers?.['content-type'] || '').toLowerCase();
-                    const sample = body.slice(0, 140).replace(/\s+/g, ' ').trim();
+                    const contentType = String(response.headers.get('content-type') || '').toLowerCase();
+                    const sample = respBodyText.slice(0, 140).replace(/\s+/g, ' ').trim();
                     lastError = new Error(
-                        `No parsable state on ${target.mode} (${proxyMode}) response (attempt ${attempt}/${maxAttempts}, status ${response.statusCode}${contentType ? `, ${contentType}` : ''}${sample ? `, sample: ${sample}` : ''}).`,
+                        `No parsable state on ${target.mode} (${proxyMode}) response (attempt ${attempt}/${maxAttempts}, status ${response.status}${contentType ? `, ${contentType}` : ''}${sample ? `, sample: ${sample}` : ''}).`,
                     );
                 } catch (error) {
                     lastError = error;
+                    lastStatusCode = undefined;
                 }
+            }
 
-                if (attempt < maxAttempts) {
-                    await sleep(250 + Math.floor(Math.random() * 300));
-                }
+            if (attempt < maxAttempts) {
+                await sleep(calculateBackoffMs(attempt, lastStatusCode));
             }
         }
     }
@@ -944,16 +964,23 @@ await Actor.main(async () => {
                 const dedupeKey = item?.id ?? item?.relativeUrl ?? `${candidateIndex + 1}-${pageNumber}-${totalSaved + pageBatch.length}`;
                 if (seenIds.has(dedupeKey)) continue;
 
-                const mapped = mapSearchItem({
-                    item,
-                    pageNumber,
-                    searchId,
-                });
+                try {
+                    const mapped = mapSearchItem({
+                        item,
+                        pageNumber,
+                        searchId,
+                    });
 
-                if (!isValidMappedRecord(mapped)) continue;
+                    if (!isValidMappedRecord(mapped)) {
+                        log.warning(`Skipping invalid record (key: ${dedupeKey})`);
+                        continue;
+                    }
 
-                seenIds.add(dedupeKey);
-                pageBatch.push(mapped);
+                    seenIds.add(dedupeKey);
+                    pageBatch.push(mapped);
+                } catch (error) {
+                    log.warning(`Skipping item due to mapping error (key: ${dedupeKey}): ${error.message}`);
+                }
             }
 
             if (pageBatch.length) {
