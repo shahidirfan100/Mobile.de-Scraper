@@ -24,20 +24,21 @@
     "max_pages": {
       "title": "Maximum number of pages",
       "type": "integer",
-      "description": "Safety cap on paginated search result pages.",
+      "description": "Maximum search-result pages to scan. The actor stops earlier when results_wanted is reached.",
       "minimum": 1,
       "editor": "number",
-      "default": 3,
+      "default": 50,
       "prefill": 3,
       "example": 3
     },
     "proxyConfiguration": {
       "title": "Proxy configuration",
       "type": "object",
-      "description": "Use Apify Proxy for better reliability.",
+      "description": "Use Apify Residential Proxy with Germany routing for reliable pagination.",
       "editor": "proxy",
       "default": {
-        "useApifyProxy": false
+        "useApifyProxy": true,
+        "apifyProxyGroups": ["RESIDENTIAL"]
       }
     }
   },

@@ -9,7 +9,9 @@ const FAIL_ON_EMPTY_RESULTS_INTERNAL = false;
 const START_URL_ALLOWED_HOST_SUFFIX = 'mobile.de';
 const MAX_RESULTS_WANTED = 2000;
 const MAX_PAGES = 50;
-const USE_SECONDARY_CANDIDATES_WHEN_PARTIAL = false;
+const DEFAULT_MAX_PAGES = 50;
+const RESIDENTIAL_PROXY_GROUP = 'RESIDENTIAL';
+const RESIDENTIAL_PROXY_COUNTRY = 'DE';
 
 const toPositiveInt = (value, fallback) => {
     const n = Number(value);
@@ -122,13 +124,20 @@ const maybeInteger = (value) => {
     return Number.isInteger(n) ? n : undefined;
 };
 
+const getItemTitle = (item) => {
+    if (typeof item?.title === 'string' && item.title.trim()) return item.title.trim();
+    const titleParts = [item?.shortTitle, item?.subTitle]
+        .filter((part) => typeof part === 'string' && part.trim())
+        .map((part) => part.trim());
+    return titleParts.length ? titleParts.join(' ') : undefined;
+};
+
 const isRealListingItem = (item) => {
     return Boolean(
         item
         && typeof item === 'object'
         && maybeInteger(item.id) !== undefined
-        && typeof item.title === 'string'
-        && item.title.trim(),
+        && getItemTitle(item),
     );
 };
 
@@ -349,28 +358,28 @@ const findSearchResultsInNode = (root) => {
     return null;
 };
 
-const extractSearchResultsFromHtml = (html) => {
-    if (typeof html !== 'string' || !html.trim()) return null;
+const extractSearchResultsFromStructuredPage = (body) => {
+    if (typeof body !== 'string' || !body.trim() || !body.includes('searchResults')) return null;
 
-    const initialState = extractInitialState(html);
+    const initialState = extractInitialState(body);
     const initialStateSearchResults = findSearchResultsInNode(initialState);
     if (initialStateSearchResults) return initialStateSearchResults;
 
-    const nextDataMatch = html.match(/<script[^>]*id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i);
+    const nextDataMatch = body.match(/<script[^>]*id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i);
     const nextData = parseJsonSafely(nextDataMatch?.[1]?.trim());
     const nextDataSearchResults = findSearchResultsInNode(nextData);
     if (nextDataSearchResults) return nextDataSearchResults;
 
     const markerRegex = /["']searchResults["']\s*:\s*/g;
     while (true) {
-        const markerMatch = markerRegex.exec(html);
+        const markerMatch = markerRegex.exec(body);
         if (markerMatch === null) break;
 
         let cursor = markerMatch.index + markerMatch[0].length;
-        while (cursor < html.length && /\s/.test(html[cursor])) cursor++;
-        if (html[cursor] !== '{') continue;
+        while (cursor < body.length && /\s/.test(body[cursor])) cursor++;
+        if (body[cursor] !== '{') continue;
 
-        const jsonFragment = extractBalancedJson(html, cursor);
+        const jsonFragment = extractBalancedJson(body, cursor);
         const candidate = parseJsonSafely(jsonFragment);
         if (isSearchResultsObject(candidate)) return candidate;
 
@@ -380,7 +389,7 @@ const extractSearchResultsFromHtml = (html) => {
 
     const scriptRegex = /<script\b[^>]*>([\s\S]*?)<\/script>/gi;
     while (true) {
-        const scriptMatch = scriptRegex.exec(html);
+        const scriptMatch = scriptRegex.exec(body);
         if (scriptMatch === null) break;
 
         const scriptContent = scriptMatch[1]?.trim();
@@ -416,19 +425,12 @@ const extractSearchResultsFromHtml = (html) => {
     return null;
 };
 
-const isLikelyHtml = (body) => {
-    if (typeof body !== 'string') return false;
-    const sample = body.slice(0, 2000).toLowerCase();
-    return sample.includes('<!doctype html') || sample.includes('<html') || sample.includes('<head') || sample.includes('<body');
-};
-
 const isLikelyBlockedResponse = ({ body, statusCode }) => {
     const text = typeof body === 'string' ? body.toLowerCase() : '';
     if (statusCode === 403 || statusCode === 429) return true;
     if (!text) return false;
     const markers = [
         'access denied',
-        'forbidden',
         'captcha',
         'verify you are human',
         'security check',
@@ -436,23 +438,6 @@ const isLikelyBlockedResponse = ({ body, statusCode }) => {
         'too many requests',
     ];
     return markers.some((marker) => text.includes(marker));
-};
-
-const buildSearchUrlFromKeyword = ({ keyword }) => {
-    const normalizedKeyword = typeof keyword === 'string' ? keyword.trim() : '';
-    if (!normalizedKeyword) {
-        throw new Error('No valid fallback search term found in startUrl.');
-    }
-
-    const url = new URL('https://suchen.mobile.de/fahrzeuge/search.html');
-    url.searchParams.set('dam', 'false');
-    url.searchParams.set('isSearchRequest', 'true');
-    url.searchParams.set('ref', 'homeAISearch');
-    url.searchParams.set('s', 'Car');
-    url.searchParams.set('vc', 'Car');
-    url.searchParams.set('userInput', normalizedKeyword);
-
-    return url.toString();
 };
 
 const normalizeSearchUrl = (rawUrl) => {
@@ -468,69 +453,17 @@ const normalizeSearchUrl = (rawUrl) => {
     }
 };
 
-const extractKeywordFromSearchUrl = (rawUrl) => {
-    const parsed = parseInputUrlLoosely(rawUrl);
-    if (parsed) {
-        const value = parsed.searchParams.get('userInput')
-            || parsed.searchParams.get('q')
-            || parsed.searchParams.get('query')
-            || parsed.searchParams.get('keyword')
-            || '';
-        const normalized = value.trim();
-        if (normalized) return normalized;
-    }
-
-    if (typeof rawUrl !== 'string') return undefined;
-    const decoded = tryDecodeUrlText(rawUrl);
-    const match = decoded.match(/[?&#](?:userInput|q|query|keyword)=([^&#]+)/i);
-    if (!match?.[1]) return undefined;
-    const normalized = tryDecodeUrlText(match[1]).replace(/\+/g, ' ').trim();
-    return normalized || undefined;
-};
-
 const buildBaseSearchUrlCandidates = ({ startUrl }) => {
-    const candidates = [];
-    const seen = new Set();
-    const add = (url, source) => {
-        if (typeof url !== 'string') return;
-        const trimmed = url.trim();
-        if (!trimmed || seen.has(trimmed)) return;
-        seen.add(trimmed);
-        candidates.push({ url: trimmed, source });
-    };
-
-    if (typeof startUrl === 'string' && startUrl.trim()) {
-        const parsedStartUrl = parseInputUrlLoosely(startUrl);
-        if (!parsedStartUrl) {
-            log.warning(`Invalid startUrl provided. Ignoring: ${startUrl}`);
-        } else if (!isAllowedStartUrlHost(parsedStartUrl.hostname)) {
-            log.warning(`Ignoring startUrl with non-mobile.de host: ${parsedStartUrl.hostname}`);
-        } else {
-            add(normalizeSearchUrl(parsedStartUrl.toString()), 'startUrl');
-        }
+    const parsedStartUrl = parseInputUrlLoosely(startUrl);
+    if (!parsedStartUrl) throw new Error('A valid Mobile.de startUrl is required.');
+    if (!isAllowedStartUrlHost(parsedStartUrl.hostname)) {
+        throw new Error(`startUrl host is not allowed: ${parsedStartUrl.hostname}`);
     }
 
-    const keywords = [];
-    const addKeyword = (value) => {
-        if (typeof value !== 'string') return;
-        const normalized = value.trim();
-        if (normalized && !keywords.includes(normalized)) keywords.push(normalized);
-    };
-    addKeyword(startUrl ? extractKeywordFromSearchUrl(startUrl) : undefined);
-
-    for (const candidateKeyword of keywords) {
-        try {
-            add(buildSearchUrlFromKeyword({ keyword: candidateKeyword }), 'keyword');
-        } catch {
-            // ignored
-        }
-    }
-
-    if (!candidates.length) {
-        throw new Error('No valid search URL candidate could be generated from startUrl.');
-    }
-
-    return candidates;
+    return [{
+        url: normalizeSearchUrl(parsedStartUrl.toString()),
+        source: 'user-start-url',
+    }];
 };
 
 const withPageNumber = (rawUrl, pageNumber) => {
@@ -543,19 +476,6 @@ const toMobileHostUrl = (rawUrl) => {
     const url = new URL(rawUrl);
     url.hostname = 'm.mobile.de';
     return url.toString();
-};
-
-const toConsumerApiUrls = (rawSearchUrl, endpointPath) => {
-    const searchUrl = new URL(rawSearchUrl);
-    const hosts = ['m.mobile.de', 'www.mobile.de'];
-
-    return hosts.map((host) => {
-        const apiUrl = new URL(`https://${host}/consumer/api/${endpointPath}`);
-        for (const [key, value] of searchUrl.searchParams.entries()) {
-            apiUrl.searchParams.set(key, value);
-        }
-        return apiUrl.toString();
-    });
 };
 
 const wrapSearchResultsState = (searchResults) => ({
@@ -594,7 +514,7 @@ const mapSearchItem = ({ item, pageNumber, searchId }) => {
 
     const mapped = {
         listing_id: item?.id,
-        title: item?.title,
+        title: getItemTitle(item),
         make: item?.make,
         model: item?.model,
         category: item?.category,
@@ -657,203 +577,86 @@ const isValidMappedRecord = (record) => {
     );
 };
 
-const fetchSearchStateViaApi = async ({ searchUrl, proxyConfiguration, maxAttempts }) => {
-    const attempts = [
-        {
-            mode: 'consumer-api-srp',
-            endpointPath: 'search/srp',
-            parseResults: (payload) => payload?.searchResults,
-        },
-        {
-            mode: 'consumer-api-items',
-            endpointPath: 'search/srp/items',
-            parseResults: (payload) => {
-                if (!Array.isArray(payload?.items)) return null;
-                return {
-                    items: payload.items,
-                    hasNextPage: payload.hasNextPage,
-                    searchId: payload.searchId,
-                };
-            },
-        },
-    ];
-    let lastError;
-    let lastStatusCode;
-    const proxyModes = proxyConfiguration ? ['proxy', 'direct'] : ['direct'];
+const getListingDedupeKey = ({ item, candidateIndex, pageNumber, position }) => {
+    const listingId = maybeInteger(item?.id);
+    if (listingId !== undefined) return `id:${listingId}`;
 
-    for (const proxyMode of proxyModes) {
-        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-            const proxyUrl = proxyMode === 'proxy' ? await proxyConfiguration.newUrl() : undefined;
-            const impit = proxyUrl
-                ? new Impit({ browser: 'chrome', http3: true, ignoreTlsErrors: true, proxyUrl })
-                : new Impit({ browser: 'chrome', http3: true, ignoreTlsErrors: true });
+    const relativeUrl = typeof item?.relativeUrl === 'string' ? item.relativeUrl.trim() : '';
+    if (relativeUrl) return `url:${relativeUrl}`;
 
-            for (const target of attempts) {
-                const candidateApiUrls = toConsumerApiUrls(searchUrl, target.endpointPath);
-                for (const apiUrl of candidateApiUrls) {
-                    const apiHost = new URL(apiUrl).hostname;
-                    try {
-                        const response = await impit.fetch(apiUrl, {
-                            signal: AbortSignal.timeout(45000),
-                            headers: {
-                                'user-agent': DESKTOP_USER_AGENT,
-                                accept: 'application/json,text/plain,*/*',
-                                'accept-language': 'en-US,en;q=0.9,de;q=0.8',
-                                'cache-control': 'no-cache',
-                                pragma: 'no-cache',
-                                referer: searchUrl,
-                                'x-requested-with': 'XMLHttpRequest',
-                            },
-                        });
-
-                        const body = await response.text();
-                        const contentType = String(response.headers.get('content-type') || '').toLowerCase();
-                        const trimmedBody = body.trimStart();
-
-                        lastStatusCode = response.status;
-                        if (isLikelyBlockedResponse({ body, statusCode: response.status })) {
-                            const sample = body.slice(0, 140).replace(/\s+/g, ' ').trim();
-                            lastError = new Error(
-                                `Blocked/challenge response on ${target.mode}:${apiHost} (${proxyMode}) (attempt ${attempt}/${maxAttempts}, status ${response.status}${sample ? `, sample: ${sample}` : ''}).`,
-                            );
-                            continue;
-                        }
-
-                        let searchResults = null;
-                        if (trimmedBody.startsWith('{') || trimmedBody.startsWith('[') || contentType.includes('json')) {
-                            const payload = parseJsonSafely(body);
-                            if (payload) {
-                                searchResults = target.parseResults(payload) || findSearchResultsInNode(payload);
-                            }
-                        }
-
-                        if (!searchResults && isLikelyHtml(body)) {
-                            searchResults = extractSearchResultsFromHtml(body);
-                        }
-
-                        if (searchResults && Array.isArray(searchResults.items)) {
-                            const modeSuffix = proxyMode === 'proxy' ? '' : '-direct';
-                            return {
-                                state: wrapSearchResultsState(searchResults),
-                                mode: `${target.mode}-${apiHost}${modeSuffix}`,
-                            };
-                        }
-
-                        const sample = body.slice(0, 140).replace(/\s+/g, ' ').trim();
-                        lastError = new Error(
-                            `No parsable search results on ${target.mode}:${apiHost} (${proxyMode}) response (attempt ${attempt}/${maxAttempts}, status ${response.status}${contentType ? `, ${contentType}` : ''}${sample ? `, sample: ${sample}` : ''}).`,
-                        );
-                    } catch (error) {
-                        lastError = error;
-                        lastStatusCode = undefined;
-                    }
-                }
-            }
-
-            if (attempt < maxAttempts) {
-                await sleep(calculateBackoffMs(attempt, lastStatusCode));
-            }
-        }
-    }
-
-    throw new Error(`Unable to fetch a valid API search response: ${searchUrl}. ${lastError?.message || ''}`.trim());
+    return `fallback:${candidateIndex}:${pageNumber}:${position}`;
 };
 
 const fetchSearchState = async ({
     searchUrl,
     proxyConfiguration,
     maxAttempts,
-    preferApiFirst = true,
+    sessionPrefix,
 }) => {
-    const tryApi = async () => fetchSearchStateViaApi({
-        searchUrl,
-        proxyConfiguration,
-        maxAttempts,
-    });
-
-    if (preferApiFirst) {
-        try {
-            return await tryApi();
-        } catch {
-            // API-first failed, continue with HTML fallback modes
-        }
-    }
-
     const attempts = [
-        { mode: 'desktop', url: searchUrl, userAgent: DESKTOP_USER_AGENT },
-        { mode: 'mobile-fallback', url: toMobileHostUrl(searchUrl), userAgent: MOBILE_USER_AGENT },
+        { mode: 'structured-page-mobile', url: toMobileHostUrl(searchUrl), userAgent: MOBILE_USER_AGENT },
+        { mode: 'structured-page-canonical', url: searchUrl, userAgent: DESKTOP_USER_AGENT },
     ];
     let lastError;
     let lastStatusCode;
-    const proxyModes = proxyConfiguration ? ['proxy', 'direct'] : ['direct'];
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        // Apify Proxy session IDs allow only word characters, dots, underscores, and tildes.
+        const sessionId = `${sessionPrefix}_attempt_${attempt}`.replace(/[^\w.~]/g, '_');
+        const proxyUrl = proxyConfiguration ? await proxyConfiguration.newUrl(sessionId) : undefined;
+        const impit = proxyUrl
+            ? new Impit({ browser: 'chrome', http3: true, ignoreTlsErrors: true, proxyUrl })
+            : new Impit({ browser: 'chrome', http3: true, ignoreTlsErrors: true });
 
-    for (const proxyMode of proxyModes) {
-        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-            const proxyUrl = proxyMode === 'proxy' ? await proxyConfiguration.newUrl() : undefined;
-            const impit = proxyUrl
-                ? new Impit({ browser: 'chrome', http3: true, ignoreTlsErrors: true, proxyUrl })
-                : new Impit({ browser: 'chrome', http3: true, ignoreTlsErrors: true });
+        for (const target of attempts) {
+            try {
+                const response = await impit.fetch(target.url, {
+                    signal: AbortSignal.timeout(45000),
+                    headers: {
+                        'user-agent': target.userAgent,
+                        accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                        'accept-language': 'en-US,en;q=0.9,de;q=0.8',
+                        'cache-control': 'no-cache',
+                        pragma: 'no-cache',
+                        referer: 'https://www.mobile.de/',
+                    },
+                });
 
-            for (const target of attempts) {
-                try {
-                    const response = await impit.fetch(target.url, {
-                        signal: AbortSignal.timeout(45000),
-                        headers: {
-                            'user-agent': target.userAgent,
-                            accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                            'accept-language': 'en-US,en;q=0.9,de;q=0.8',
-                            'cache-control': 'no-cache',
-                            pragma: 'no-cache',
-                            referer: 'https://www.mobile.de/',
-                        },
-                    });
+                const responseBody = await response.text();
+                lastStatusCode = response.status;
 
-                    const respBodyText = await response.text();
-                    lastStatusCode = response.status;
-
-                    if (isLikelyBlockedResponse({ body: respBodyText, statusCode: response.status })) {
-                        const sample = respBodyText.slice(0, 140).replace(/\s+/g, ' ').trim();
-                        lastError = new Error(
-                            `Blocked/challenge page on ${target.mode} (${proxyMode}) response (attempt ${attempt}/${maxAttempts}, status ${response.status}${sample ? `, sample: ${sample}` : ''}).`,
-                        );
-                        continue;
-                    }
-
-                    const searchResults = extractSearchResultsFromHtml(respBodyText);
-                    if (searchResults && Array.isArray(searchResults.items)) {
-                        const modeSuffix = proxyMode === 'proxy' ? '' : '-direct';
-                        return {
-                            state: wrapSearchResultsState(searchResults),
-                            mode: `${target.mode}${modeSuffix}`,
-                        };
-                    }
-
-                    const contentType = String(response.headers.get('content-type') || '').toLowerCase();
-                    const sample = respBodyText.slice(0, 140).replace(/\s+/g, ' ').trim();
+                if (isLikelyBlockedResponse({ body: responseBody, statusCode: response.status })) {
+                    const sample = responseBody.slice(0, 140).replace(/\s+/g, ' ').trim();
                     lastError = new Error(
-                        `No parsable state on ${target.mode} (${proxyMode}) response (attempt ${attempt}/${maxAttempts}, status ${response.status}${contentType ? `, ${contentType}` : ''}${sample ? `, sample: ${sample}` : ''}).`,
+                        `Blocked/challenge response on ${target.mode} (attempt ${attempt}/${maxAttempts}, status ${response.status}${sample ? `, sample: ${sample}` : ''}).`,
                     );
-                } catch (error) {
-                    lastError = error;
-                    lastStatusCode = undefined;
+                    continue;
                 }
-            }
 
-            if (attempt < maxAttempts) {
-                await sleep(calculateBackoffMs(attempt, lastStatusCode));
+                const searchResults = extractSearchResultsFromStructuredPage(responseBody);
+                if (searchResults && Array.isArray(searchResults.items)) {
+                    return {
+                        state: wrapSearchResultsState(searchResults),
+                        mode: `${target.mode}${proxyUrl ? '-residential' : '-direct'}`,
+                    };
+                }
+
+                const contentType = String(response.headers.get('content-type') || '').toLowerCase();
+                const sample = responseBody.slice(0, 140).replace(/\s+/g, ' ').trim();
+                lastError = new Error(
+                    `No structured search results on ${target.mode} (attempt ${attempt}/${maxAttempts}, status ${response.status}${contentType ? `, ${contentType}` : ''}${sample ? `, sample: ${sample}` : ''}).`,
+                );
+            } catch (error) {
+                lastError = error;
+                lastStatusCode = undefined;
             }
+        }
+
+        if (attempt < maxAttempts) {
+            await sleep(calculateBackoffMs(attempt, lastStatusCode));
         }
     }
 
-    if (!preferApiFirst) {
-        try {
-            return await tryApi();
-        } catch (error) {
-            lastError = error;
-        }
-    }
-
-    throw new Error(`Unable to fetch a valid search page: ${searchUrl}. ${lastError?.message || ''}`.trim());
+    throw new Error(`Unable to fetch structured search data: ${searchUrl}. ${lastError?.message || ''}`.trim());
 };
 
 await Actor.main(async () => {
@@ -869,13 +672,19 @@ await Actor.main(async () => {
     const {
         startUrl,
         results_wanted: resultsWantedInput = 20,
-        max_pages: maxPagesInput = 3,
+        max_pages: maxPagesInput = DEFAULT_MAX_PAGES,
         proxyConfiguration: proxyConfigInput,
     } = input;
 
     const resultsWanted = clampInt(toPositiveInt(resultsWantedInput, 20), 1, MAX_RESULTS_WANTED);
-    const maxPages = clampInt(toPositiveInt(maxPagesInput, 3), 1, MAX_PAGES);
-    const fetchAttempts = 2;
+    const configuredMaxPages = clampInt(toPositiveInt(maxPagesInput, DEFAULT_MAX_PAGES), 1, MAX_PAGES);
+    const minimumPagesForTarget = Math.ceil(resultsWanted / 20);
+    const maxPages = Math.min(MAX_PAGES, Math.max(configuredMaxPages, minimumPagesForTarget));
+    const fetchAttempts = 4;
+
+    if (maxPages > configuredMaxPages) {
+        log.info(`Pagination cap expanded from ${configuredMaxPages} to ${maxPages} pages for results_wanted=${resultsWanted}.`);
+    }
     let baseSearchCandidates;
     try {
         baseSearchCandidates = buildBaseSearchUrlCandidates({ startUrl });
@@ -892,26 +701,42 @@ await Actor.main(async () => {
     }
 
     const runWarnings = [];
-    const shouldUseDefaultProxy = !proxyConfigInput && Actor.isAtHome();
-    const effectiveProxyConfig = proxyConfigInput || (shouldUseDefaultProxy ? { useApifyProxy: true } : undefined);
+    const hasCustomProxyUrls = Array.isArray(proxyConfigInput?.proxyUrls) && proxyConfigInput.proxyUrls.length > 0;
+    const shouldUseResidentialProxy = Actor.isAtHome() && !hasCustomProxyUrls;
+    const shouldIgnoreApifyProxyLocally = !Actor.isAtHome() && !hasCustomProxyUrls && proxyConfigInput?.useApifyProxy;
+    let effectiveProxyConfig;
+    if (shouldUseResidentialProxy) {
+        effectiveProxyConfig = {
+            ...(proxyConfigInput || {}),
+            useApifyProxy: true,
+            apifyProxyGroups: [RESIDENTIAL_PROXY_GROUP],
+            countryCode: proxyConfigInput?.countryCode || RESIDENTIAL_PROXY_COUNTRY,
+        };
+    } else if (!shouldIgnoreApifyProxyLocally) {
+        effectiveProxyConfig = proxyConfigInput;
+    }
     let proxyConfiguration;
     if (effectiveProxyConfig) {
         try {
             proxyConfiguration = await Actor.createProxyConfiguration(effectiveProxyConfig);
         } catch (error) {
-            const warning = `Proxy initialization failed, continuing without proxy: ${error.message}`;
+            const warning = `Proxy initialization failed: ${error.message}`;
             runWarnings.push(warning);
             log.warning(warning);
-            proxyConfiguration = undefined;
+            if (shouldUseResidentialProxy) throw error;
         }
     }
 
-    if (shouldUseDefaultProxy) {
-        // Keep quiet here; ProxyConfiguration itself emits useful warnings when misconfigured.
+    if (shouldUseResidentialProxy) {
+        log.info(`Proxy mode | Apify Residential | country=${effectiveProxyConfig.countryCode}`);
+    } else if (shouldIgnoreApifyProxyLocally) {
+        log.info('Proxy mode | local run without Apify Proxy');
     }
 
     let totalSaved = 0;
     const seenIds = new Set();
+    let duplicateCount = 0;
+    let invalidRecordCount = 0;
 
     for (let candidateIndex = 0; candidateIndex < baseSearchCandidates.length; candidateIndex++) {
         if (totalSaved >= resultsWanted) break;
@@ -920,9 +745,6 @@ await Actor.main(async () => {
         let discoveredTotalPages = Number.POSITIVE_INFINITY;
         let savedByCandidate = 0;
         const candidateLabel = `${candidateIndex + 1}/${baseSearchCandidates.length}`;
-        let preferApiFirst = candidate.source !== 'keyword';
-        let lowYieldPagesInRow = 0;
-
         for (let pageNumber = 1; pageNumber <= maxPages && pageNumber <= discoveredTotalPages; pageNumber++) {
             if (totalSaved >= resultsWanted) break;
 
@@ -934,14 +756,20 @@ await Actor.main(async () => {
                     searchUrl,
                     proxyConfiguration,
                     maxAttempts: fetchAttempts,
-                    preferApiFirst,
+                    sessionPrefix: `mobilede_${candidateIndex + 1}_page_${pageNumber}`,
                 });
                 state = fetched.state;
+                if (pageNumber === 1) log.info(`Source selected | ${fetched.mode}`);
             } catch (error) {
                 const warning = `Page fetch failed for candidate ${candidateLabel} page ${pageNumber}: ${error.message}`;
                 runWarnings.push(warning);
                 log.warning(warning);
-                break;
+                if (totalSaved === 0) {
+                    log.warning('Initial page could not be fetched; stopping because no valid listings are available to continue from.');
+                    break;
+                }
+                log.info(`Continuing to the next page after exhausting retries for page ${pageNumber}.`);
+                continue;
             }
 
             const searchResults = state?.search?.srp?.data?.searchResults || {};
@@ -961,8 +789,16 @@ await Actor.main(async () => {
             for (const item of items) {
                 if (totalSaved + pageBatch.length >= resultsWanted) break;
 
-                const dedupeKey = item?.id ?? item?.relativeUrl ?? `${candidateIndex + 1}-${pageNumber}-${totalSaved + pageBatch.length}`;
-                if (seenIds.has(dedupeKey)) continue;
+                const dedupeKey = getListingDedupeKey({
+                    item,
+                    candidateIndex,
+                    pageNumber,
+                    position: pageBatch.length,
+                });
+                if (seenIds.has(dedupeKey)) {
+                    duplicateCount++;
+                    continue;
+                }
 
                 try {
                     const mapped = mapSearchItem({
@@ -972,6 +808,7 @@ await Actor.main(async () => {
                     });
 
                     if (!isValidMappedRecord(mapped)) {
+                        invalidRecordCount++;
                         log.warning(`Skipping invalid record (key: ${dedupeKey})`);
                         continue;
                     }
@@ -990,26 +827,11 @@ await Actor.main(async () => {
                 log.info(`Saved ${pageBatch.length} listings from page ${pageNumber}. Total: ${totalSaved}/${resultsWanted}`);
             }
 
-            if (items.length >= 20 && pageBatch.length <= 5) {
-                lowYieldPagesInRow++;
-            } else {
-                lowYieldPagesInRow = 0;
-            }
-
-            if (preferApiFirst && lowYieldPagesInRow >= 2) {
-                preferApiFirst = false;
-            }
-
             if (searchResults.hasNextPage === false) break;
         }
 
         if (savedByCandidate === 0 && candidateIndex < baseSearchCandidates.length - 1) {
-            log.warning(`Candidate ${candidateLabel} produced no listings. Trying next candidate.`);
-            continue;
-        }
-
-        if (savedByCandidate > 0 && !USE_SECONDARY_CANDIDATES_WHEN_PARTIAL) {
-            break;
+            log.warning(`Candidate ${candidateLabel} produced no listings. Trying the same filtered URL on the next host.`);
         }
     }
 
@@ -1032,4 +854,6 @@ await Actor.main(async () => {
     if (runWarnings.length) {
         log.warning(`Completed with ${runWarnings.length} warning(s). Last warning: ${runWarnings[runWarnings.length - 1]}`);
     }
+
+    log.info(`Quality summary | saved=${totalSaved} | duplicates_removed=${duplicateCount} | invalid_records_skipped=${invalidRecordCount}`);
 });
