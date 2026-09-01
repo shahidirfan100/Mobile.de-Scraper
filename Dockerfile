@@ -1,15 +1,12 @@
-FROM alpine:latest
+FROM apify/actor-node:22
 
-RUN apk add --no-cache nodejs npm
+COPY --chown=myuser:myuser package*.json ./
+RUN npm --quiet set progress=false \
+    && npm install --omit=dev --include=optional \
+    && node -e "import('impit').then(() => console.log('impit OK'))" \
+    && rm -rf ~/.npm
 
-RUN addgroup app && adduser app -G app -D
-WORKDIR /home/app
-USER app
-
-COPY --chown=app:app package*.json ./
-RUN npm i --omit=dev && rm -r ~/.npm || true
-
-COPY --chown=app:app . ./
+COPY --chown=myuser:myuser . ./
 
 ENV APIFY_LOG_LEVEL=INFO
 

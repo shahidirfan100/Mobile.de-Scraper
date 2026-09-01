@@ -3,8 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { Actor, log } from 'apify';
 import { Impit } from 'impit';
 
-const DESKTOP_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0';
-const MOBILE_USER_AGENT = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Mobile/15E148 Safari/604.1';
+const STRUCTURED_PAGE_BROWSER = 'ios18';
 const FAIL_ON_EMPTY_RESULTS_INTERNAL = false;
 const START_URL_ALLOWED_HOST_SUFFIX = 'mobile.de';
 const MAX_RESULTS_WANTED = 2000;
@@ -12,6 +11,14 @@ const MAX_PAGES = 50;
 const DEFAULT_MAX_PAGES = 50;
 const RESIDENTIAL_PROXY_GROUP = 'RESIDENTIAL';
 const RESIDENTIAL_PROXY_COUNTRY = 'DE';
+const SUPPORTED_COUNTRY_CODES = new Set([
+    'DE', 'EG', 'AL', 'AD', 'ET', 'BE', 'BA', 'BR', 'BG', 'DK', 'EE', 'FO',
+    'FI', 'FR', 'GR', 'GB', 'IE', 'IS', 'IL', 'IT', 'JP', 'JO', 'CA', 'HR',
+    'KW', 'LV', 'LB', 'LI', 'LT', 'LU', 'MT', 'MA', 'MK', 'MX', 'MD', 'MC',
+    'ME', 'NZ', 'NL', 'NG', 'NO', 'OM', 'AT', 'PL', 'PT', 'RO', 'RU', 'SM',
+    'SA', 'SE', 'CH', 'RS', 'SK', 'SI', 'ES', 'ZA', 'KR', 'TW', 'CZ', 'TN',
+    'TR', 'UA', 'HU', 'US', 'AE', 'BY', 'CY',
+]);
 
 const toPositiveInt = (value, fallback) => {
     const n = Number(value);
@@ -104,9 +111,11 @@ const sleep = (ms) => new Promise((resolve) => {
     setTimeout(resolve, ms);
 });
 
-const calculateBackoffMs = (attempt, statusCode) => {
+const calculateBackoffMs = (attempt, statusCode, wasBlocked = false) => {
     if (statusCode === 429) return Math.min(3000 * attempt, 30000);
-    if (statusCode === 403 || (statusCode >= 500 && statusCode < 600)) return Math.min(2000 * attempt, 15000);
+    if (wasBlocked || statusCode === 403 || (statusCode >= 500 && statusCode < 600)) {
+        return Math.min(2000 * attempt, 15000);
+    }
     return 250 * attempt + Math.floor(Math.random() * 300);
 };
 
@@ -124,12 +133,27 @@ const maybeInteger = (value) => {
     return Number.isInteger(n) ? n : undefined;
 };
 
+const getLocalizedValue = (value) => {
+    if (typeof value === 'string' && value.trim()) return value.trim();
+    if (typeof value?.localized === 'string' && value.localized.trim()) return value.localized.trim();
+    return undefined;
+};
+
+const getContactPhone = (contact) => {
+    if (!Array.isArray(contact?.phones)) return undefined;
+    const phone = contact.phones.find((entry) => typeof entry?.uri === 'string' && entry.uri.startsWith('tel:'));
+    return phone?.uri.replace(/^tel:/i, '');
+};
+
 const getItemTitle = (item) => {
     if (typeof item?.title === 'string' && item.title.trim()) return item.title.trim();
     const titleParts = [item?.shortTitle, item?.subTitle]
         .filter((part) => typeof part === 'string' && part.trim())
         .map((part) => part.trim());
-    return titleParts.length ? titleParts.join(' ') : undefined;
+    if (titleParts.length) return titleParts.join(' ');
+
+    const localizedParts = [getLocalizedValue(item?.make), getLocalizedValue(item?.model)].filter(Boolean);
+    return localizedParts.length ? localizedParts.join(' ') : undefined;
 };
 
 const isRealListingItem = (item) => {
@@ -159,18 +183,33 @@ const parseSrcSetUrls = (srcSet) => {
         .filter(Boolean);
 };
 
+const toImageUrl = (value, rule) => {
+    if (typeof value !== 'string' || !value.trim()) return undefined;
+
+    let url = value.trim();
+    if (url.startsWith('//')) url = `https:${url}`;
+    else if (url.startsWith('img.classistatic.de/')) url = `https://${url}`;
+    else if (!/^https?:\/\//i.test(url)) return undefined;
+
+    if (rule && !/[?&]rule=/i.test(url)) {
+        url += `${url.includes('?') ? '&' : '?'}rule=${rule}`;
+    }
+    return url;
+};
+
 const collectImageUrls = (item) => {
     const urls = new Set();
-    const addUrl = (value) => {
-        if (typeof value === 'string' && value.trim()) urls.add(value.trim());
+    const addUrl = (value, rule) => {
+        const url = toImageUrl(value, rule);
+        if (url) urls.add(url);
     };
 
-    addUrl(item?.previewImage?.src);
+    addUrl(item?.previewImage?.src, 'mo-1024');
     for (const url of parseSrcSetUrls(item?.previewImage?.srcSet)) addUrl(url);
 
     if (Array.isArray(item?.previewThumbnails)) {
         for (const thumb of item.previewThumbnails) {
-            addUrl(thumb?.src);
+            addUrl(thumb?.src, 'mo-200');
             for (const url of parseSrcSetUrls(thumb?.srcSet)) addUrl(url);
         }
     }
@@ -317,12 +356,26 @@ const extractBalancedJson = (source, startIndex) => {
     return null;
 };
 
-const isSearchResultsObject = (value) => {
-    if (!value || typeof value !== 'object' || !Array.isArray(value.items)) return false;
-    if (value.items.length === 0) return true;
+const getSearchResultItems = (value) => {
+    if (!value || typeof value !== 'object') return null;
+    if (Array.isArray(value.items)) return value.items;
+    if (Array.isArray(value.listings)) return value.listings;
+    return null;
+};
 
-    return value.items.some((item) => isRealListingItem(item)
-        || (item && typeof item === 'object' && Array.isArray(item.items)));
+const normalizeSearchResults = (value) => {
+    const items = getSearchResultItems(value);
+    if (!items) return null;
+    return Array.isArray(value.items) ? value : {...value, items};
+};
+
+const isSearchResultsObject = (value) => {
+    const items = getSearchResultItems(value);
+    if (!items) return false;
+    if (items.length === 0) return true;
+
+    return items.some((item) => isRealListingItem(item)
+        || (item && typeof item === 'object' && getSearchResultItems(item)));
 };
 
 const findSearchResultsInNode = (root) => {
@@ -358,34 +411,121 @@ const findSearchResultsInNode = (root) => {
     return null;
 };
 
-const extractSearchResultsFromStructuredPage = (body) => {
-    if (typeof body !== 'string' || !body.trim() || !body.includes('searchResults')) return null;
-
-    const initialState = extractInitialState(body);
-    const initialStateSearchResults = findSearchResultsInNode(initialState);
-    if (initialStateSearchResults) return initialStateSearchResults;
-
-    const nextDataMatch = body.match(/<script[^>]*id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i);
-    const nextData = parseJsonSafely(nextDataMatch?.[1]?.trim());
-    const nextDataSearchResults = findSearchResultsInNode(nextData);
-    if (nextDataSearchResults) return nextDataSearchResults;
-
+const extractSearchResultsFromText = (text) => {
     const markerRegex = /["']searchResults["']\s*:\s*/g;
     while (true) {
-        const markerMatch = markerRegex.exec(body);
+        const markerMatch = markerRegex.exec(text);
         if (markerMatch === null) break;
 
         let cursor = markerMatch.index + markerMatch[0].length;
-        while (cursor < body.length && /\s/.test(body[cursor])) cursor++;
-        if (body[cursor] !== '{') continue;
+        while (cursor < text.length && /\s/.test(text[cursor])) cursor++;
+        if (text[cursor] !== '{') continue;
 
-        const jsonFragment = extractBalancedJson(body, cursor);
+        const jsonFragment = extractBalancedJson(text, cursor);
         const candidate = parseJsonSafely(jsonFragment);
         if (isSearchResultsObject(candidate)) return candidate;
 
         const nestedSearchResults = findSearchResultsInNode(candidate);
         if (nestedSearchResults) return nestedSearchResults;
     }
+
+    return null;
+};
+
+const collectFlightImages = (flightText, imageMap) => {
+    if (typeof flightText !== 'string' || !flightText) return;
+
+    // Current Mobile.de pages keep image props in the Flight component tree,
+    // while searchResults.listings only contains numImages. Each listing
+    // component has its listingId followed by its primary image and thumbnails.
+    const listingRegex = /"listingId":(\d+)[\s\S]*?(?="listingId":\d+|$)/g;
+    let listingMatch = listingRegex.exec(flightText);
+    while (listingMatch !== null) {
+        const listingId = listingMatch[1];
+        const listingBlock = listingMatch[0];
+        const urls = imageMap.get(listingId) || [];
+        // Top/base cards use image-large and image-thumbnail-*; standard cards
+        // use image without a suffix. These are all emitted by the search page.
+        const imageRegex = /"src":"([^"]+)"\s*,\s*"testId":"(?:top|base|tic)-result-listing-\d+-image(?:-([^"]+))?"/g;
+        let imageMatch = imageRegex.exec(listingBlock);
+
+        while (imageMatch !== null) {
+            const kind = imageMatch[2] || 'image';
+            const rule = kind === 'large' || kind === 'image' ? 'mo-1024' : 'mo-200';
+            const imageUrl = toImageUrl(imageMatch[1], rule);
+            if (imageUrl && !urls.includes(imageUrl)) urls.push(imageUrl);
+            imageMatch = imageRegex.exec(listingBlock);
+        }
+
+        if (urls.length) imageMap.set(listingId, urls);
+        listingMatch = listingRegex.exec(flightText);
+    }
+};
+
+const addFlightImagesToSearchResults = (searchResults, imageMap) => {
+    if (!imageMap?.size || !Array.isArray(searchResults?.items)) return searchResults;
+
+    const items = searchResults.items.map((item) => {
+        const imageUrls = imageMap.get(String(item?.id));
+        if (!imageUrls?.length) return item;
+
+        return {
+            ...item,
+            previewImage: {
+                ...(item.previewImage || {}),
+                src: imageUrls[0],
+            },
+            previewThumbnails: imageUrls.slice(1).map((src) => ({src})),
+        };
+    });
+
+    return {...searchResults, items};
+};
+
+const extractSearchResultsFromFlightPayload = (body) => {
+    const flightMarker = 'self.__next_f.push(';
+    const imageMap = new Map();
+    let searchResults;
+    let searchIndex = 0;
+    while (true) {
+        const markerIndex = body.indexOf(flightMarker, searchIndex);
+        if (markerIndex < 0) break;
+
+        const payloadStart = body.indexOf('[', markerIndex + flightMarker.length);
+        if (payloadStart < 0) break;
+
+        const payload = parseJsonSafely(extractBalancedJson(body, payloadStart));
+        const flightText = Array.isArray(payload) && typeof payload[1] === 'string' ? payload[1] : '';
+        collectFlightImages(flightText, imageMap);
+        if (!searchResults) searchResults = extractSearchResultsFromText(flightText);
+
+        searchIndex = payloadStart + 1;
+    }
+
+    if (!searchResults) return null;
+    const normalizedSearchResults = normalizeSearchResults(searchResults);
+    return {
+        searchResults: addFlightImagesToSearchResults(normalizedSearchResults, imageMap),
+    };
+};
+
+const extractSearchResultsFromStructuredPage = (body) => {
+    if (typeof body !== 'string' || !body.trim() || !body.includes('searchResults')) return null;
+
+    const flightPayload = extractSearchResultsFromFlightPayload(body);
+    if (flightPayload) return flightPayload.searchResults;
+
+    const initialState = extractInitialState(body);
+    const initialStateSearchResults = findSearchResultsInNode(initialState);
+    if (initialStateSearchResults) return normalizeSearchResults(initialStateSearchResults);
+
+    const nextDataMatch = body.match(/<script[^>]*id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i);
+    const nextData = parseJsonSafely(nextDataMatch?.[1]?.trim());
+    const nextDataSearchResults = findSearchResultsInNode(nextData);
+    if (nextDataSearchResults) return normalizeSearchResults(nextDataSearchResults);
+
+    const searchResultsFromBody = extractSearchResultsFromText(body);
+    if (searchResultsFromBody) return normalizeSearchResults(searchResultsFromBody);
 
     const scriptRegex = /<script\b[^>]*>([\s\S]*?)<\/script>/gi;
     while (true) {
@@ -395,10 +535,13 @@ const extractSearchResultsFromStructuredPage = (body) => {
         const scriptContent = scriptMatch[1]?.trim();
         if (!scriptContent) continue;
 
+        const scriptFlightPayload = extractSearchResultsFromFlightPayload(scriptContent);
+        if (scriptFlightPayload) return normalizeSearchResults(scriptFlightPayload.searchResults);
+
         if (scriptContent.startsWith('{') || scriptContent.startsWith('[')) {
             const parsedScript = parseJsonSafely(scriptContent);
             const parsedScriptSearchResults = findSearchResultsInNode(parsedScript);
-            if (parsedScriptSearchResults) return parsedScriptSearchResults;
+            if (parsedScriptSearchResults) return normalizeSearchResults(parsedScriptSearchResults);
             continue;
         }
 
@@ -418,7 +561,7 @@ const extractSearchResultsFromStructuredPage = (body) => {
             const jsonFragment = extractBalancedJson(scriptContent, valueStart);
             const parsedScript = parseJsonSafely(jsonFragment);
             const parsedScriptSearchResults = findSearchResultsInNode(parsedScript);
-            if (parsedScriptSearchResults) return parsedScriptSearchResults;
+            if (parsedScriptSearchResults) return normalizeSearchResults(parsedScriptSearchResults);
         }
     }
 
@@ -436,24 +579,102 @@ const isLikelyBlockedResponse = ({ body, statusCode }) => {
         'security check',
         'bot challenge',
         'too many requests',
+        'sec-if-cpt-container',
     ];
-    return markers.some((marker) => text.includes(marker));
+    const compactChallengeShell = /<body>\s*<script\b[^>]+\bsrc=["'][^"']+["'][^>]*>\s*<\/script>\s*<\/body>/i.test(text);
+    return compactChallengeShell || markers.some((marker) => text.includes(marker));
 };
 
-const normalizeSearchUrl = (rawUrl) => {
+const normalizeRangeFilter = (value, name, validatePart) => {
+    if (value === undefined || value === null || String(value).trim() === '') return undefined;
+
+    const raw = String(value).trim().replace(/\s+/g, '');
+    const parts = raw.split(':');
+    if (parts.length > 2 || !raw) {
+        throw new Error(`${name} must be a value or range in the form MIN:MAX.`);
+    }
+
+    const [minimum, maximum] = parts.length === 2 ? parts : [parts[0], parts[0]];
+    if (!minimum && !maximum) throw new Error(`${name} must contain at least one value.`);
+    if ((minimum && !validatePart(minimum)) || (maximum && !validatePart(maximum))) {
+        throw new Error(`${name} contains an invalid value: ${value}.`);
+    }
+
+    return parts.length === 2 ? `${minimum}:${maximum}` : minimum;
+};
+
+const normalizeYearFilter = (value) => normalizeRangeFilter(
+    value,
+    'year',
+    (part) => /^(?:19|20)\d{2}$/.test(part),
+);
+
+const normalizePriceFilter = (value) => normalizeRangeFilter(
+    value,
+    'price',
+    (part) => /^\d+$/.test(part),
+);
+
+const normalizeCountryCode = (value) => {
+    if (value === undefined || value === null || String(value).trim() === '') return undefined;
+    const countryCode = String(value).trim().toUpperCase();
+    if (!SUPPORTED_COUNTRY_CODES.has(countryCode)) {
+        throw new Error(`country must be one of Mobile.de's supported ISO country codes: ${[...SUPPORTED_COUNTRY_CODES].join(', ')}.`);
+    }
+    return countryCode;
+};
+
+const isNumericId = (value) => typeof value === 'string' && /^\d+$/.test(value);
+
+const applyMakeModelFilters = (url, { make, model }) => {
+    const makeValue = make === undefined || make === null ? '' : String(make).trim();
+    const modelValue = model === undefined || model === null ? '' : String(model).trim();
+    if (!makeValue && !modelValue) return;
+
+    if (isNumericId(makeValue) && (!modelValue || isNumericId(modelValue))) {
+        url.searchParams.set('ms', `${makeValue};${modelValue};;`);
+        // userInput is a broad text search and can counteract an exact ms filter.
+        url.searchParams.delete('userInput');
+        return;
+    }
+
+    // Mobile.de's exact make/model selector uses numeric IDs. For text values,
+    // use the service's supported full-text search rather than inventing IDs.
+    url.searchParams.delete('ms');
+    url.searchParams.set('userInput', [makeValue, modelValue].filter(Boolean).join(' '));
+};
+
+const normalizeSearchUrl = (rawUrl, filters = {}) => {
     try {
         const url = new URL(rawUrl);
         url.protocol = 'https:';
         url.searchParams.set('isSearchRequest', 'true');
         if (!url.searchParams.has('s')) url.searchParams.set('s', 'Car');
         if (!url.searchParams.has('vc')) url.searchParams.set('vc', 'Car');
+
+        applyMakeModelFilters(url, filters);
+
+        const optionalFilters = [
+            ['location', 'gn', (value) => String(value).trim()],
+            ['year', 'fr', normalizeYearFilter],
+            ['price', 'p', normalizePriceFilter],
+            ['country', 'cn', normalizeCountryCode],
+        ];
+        for (const [inputName, queryParameter, normalize] of optionalFilters) {
+            const inputValue = filters[inputName];
+            if (inputValue === undefined || inputValue === null || String(inputValue).trim() === '') continue;
+            const normalizedValue = normalize(inputValue);
+            if (normalizedValue) url.searchParams.set(queryParameter, normalizedValue);
+        }
+
         return url.toString();
-    } catch {
-        return rawUrl;
+    } catch (error) {
+        if (error instanceof TypeError) return rawUrl;
+        throw error;
     }
 };
 
-const buildBaseSearchUrlCandidates = ({ startUrl }) => {
+const buildBaseSearchUrlCandidates = ({ startUrl, filters }) => {
     const parsedStartUrl = parseInputUrlLoosely(startUrl);
     if (!parsedStartUrl) throw new Error('A valid Mobile.de startUrl is required.');
     if (!isAllowedStartUrlHost(parsedStartUrl.hostname)) {
@@ -461,7 +682,7 @@ const buildBaseSearchUrlCandidates = ({ startUrl }) => {
     }
 
     return [{
-        url: normalizeSearchUrl(parsedStartUrl.toString()),
+        url: normalizeSearchUrl(parsedStartUrl.toString(), filters),
         source: 'user-start-url',
     }];
 };
@@ -515,13 +736,13 @@ const mapSearchItem = ({ item, pageNumber, searchId }) => {
     const mapped = {
         listing_id: item?.id,
         title: getItemTitle(item),
-        make: item?.make,
-        model: item?.model,
+        make: getLocalizedValue(item?.make),
+        model: getLocalizedValue(item?.model),
         category: item?.category,
         vehicle_type: item?.type,
         url: toListingUrl(item?.relativeUrl, item?.id),
-        price_eur: item?.price?.grossAmount,
-        price_currency: item?.price?.grossCurrency,
+        price_eur: item?.price?.grossAmount ?? item?.price?.grs?.amount,
+        price_currency: item?.price?.grossCurrency ?? item?.price?.grs?.currency,
         first_registration: item?.attr?.fr,
         registration_year: registrationYear,
         mileage_km: maybeNumber(item?.attr?.ml),
@@ -546,8 +767,8 @@ const mapSearchItem = ({ item, pageNumber, searchId }) => {
         country_code: item?.attr?.cn,
         seller_id: item?.sellerId,
         seller_name: item?.contactInfo?.name,
-        seller_type: item?.contactInfo?.sellerType,
-        seller_phone: item?.contactInfo?.contactPhone,
+        seller_type: item?.contactInfo?.sellerType ?? item?.contact?.enumType,
+        seller_phone: item?.contactInfo?.contactPhone ?? getContactPhone(item?.contact),
         seller_rating_score: item?.contactInfo?.rating?.score,
         seller_rating_count: item?.contactInfo?.rating?.count,
         image_url: imageUrls[0],
@@ -592,43 +813,45 @@ const fetchSearchState = async ({
     proxyConfiguration,
     maxAttempts,
     sessionPrefix,
+    sessionState = {},
 }) => {
     const attempts = [
-        { mode: 'structured-page-mobile', url: toMobileHostUrl(searchUrl), userAgent: MOBILE_USER_AGENT },
-        { mode: 'structured-page-canonical', url: searchUrl, userAgent: DESKTOP_USER_AGENT },
-    ];
+        { mode: 'structured-page-mobile-ios', url: toMobileHostUrl(searchUrl) },
+        { mode: 'structured-page-canonical-ios', url: searchUrl },
+    ].filter((target, index, targets) => targets.findIndex((candidate) => candidate.url === target.url) === index);
     let lastError;
     let lastStatusCode;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        // Apify Proxy session IDs allow only word characters, dots, underscores, and tildes.
-        const sessionId = `${sessionPrefix}_attempt_${attempt}`.replace(/[^\w.~]/g, '_');
-        const proxyUrl = proxyConfiguration ? await proxyConfiguration.newUrl(sessionId) : undefined;
-        const impit = proxyUrl
-            ? new Impit({ browser: 'chrome', http3: true, ignoreTlsErrors: true, proxyUrl })
-            : new Impit({ browser: 'chrome', http3: true, ignoreTlsErrors: true });
+        let attemptWasBlocked = false;
+        let blockedError;
+        let {client: impit, proxyUrl} = sessionState;
+
+        if (!impit || attempt > 1) {
+            // Apify Proxy session IDs allow only word characters, dots, underscores, and tildes.
+            const sessionId = `${sessionPrefix}_attempt_${attempt}`.replace(/[^\w.~]/g, '_');
+            proxyUrl = proxyConfiguration ? await proxyConfiguration.newUrl(sessionId) : undefined;
+            impit = proxyUrl
+                ? new Impit({ browser: STRUCTURED_PAGE_BROWSER, ignoreTlsErrors: true, proxyUrl })
+                : new Impit({ browser: STRUCTURED_PAGE_BROWSER, ignoreTlsErrors: true });
+        }
 
         for (const target of attempts) {
             try {
                 const response = await impit.fetch(target.url, {
                     signal: AbortSignal.timeout(45000),
-                    headers: {
-                        'user-agent': target.userAgent,
-                        accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                        'accept-language': 'en-US,en;q=0.9,de;q=0.8',
-                        'cache-control': 'no-cache',
-                        pragma: 'no-cache',
-                        referer: 'https://www.mobile.de/',
-                    },
                 });
 
                 const responseBody = await response.text();
                 lastStatusCode = response.status;
 
                 if (isLikelyBlockedResponse({ body: responseBody, statusCode: response.status })) {
+                    attemptWasBlocked = true;
                     const sample = responseBody.slice(0, 140).replace(/\s+/g, ' ').trim();
-                    lastError = new Error(
+                    blockedError = new Error(
                         `Blocked/challenge response on ${target.mode} (attempt ${attempt}/${maxAttempts}, status ${response.status}${sample ? `, sample: ${sample}` : ''}).`,
                     );
+                    blockedError.isBlocked = true;
+                    lastError = blockedError;
                     continue;
                 }
 
@@ -637,6 +860,7 @@ const fetchSearchState = async ({
                     return {
                         state: wrapSearchResultsState(searchResults),
                         mode: `${target.mode}${proxyUrl ? '-residential' : '-direct'}`,
+                        sessionState: {client: impit, proxyUrl},
                     };
                 }
 
@@ -652,12 +876,16 @@ const fetchSearchState = async ({
         }
 
         if (attempt < maxAttempts) {
-            await sleep(calculateBackoffMs(attempt, lastStatusCode));
+            await sleep(calculateBackoffMs(attempt, lastStatusCode, attemptWasBlocked));
+            continue;
         }
+
+        if (blockedError) throw blockedError;
     }
 
     throw new Error(`Unable to fetch structured search data: ${searchUrl}. ${lastError?.message || ''}`.trim());
 };
+
 
 await Actor.main(async () => {
     const actorInput = await Actor.getInput();
@@ -671,6 +899,12 @@ await Actor.main(async () => {
     }
     const {
         startUrl,
+        location,
+        make,
+        model,
+        year,
+        price,
+        country,
         results_wanted: resultsWantedInput = 20,
         max_pages: maxPagesInput = DEFAULT_MAX_PAGES,
         proxyConfiguration: proxyConfigInput,
@@ -687,7 +921,10 @@ await Actor.main(async () => {
     }
     let baseSearchCandidates;
     try {
-        baseSearchCandidates = buildBaseSearchUrlCandidates({ startUrl });
+        baseSearchCandidates = buildBaseSearchUrlCandidates({
+            startUrl,
+            filters: {location, make, model, year, price, country},
+        });
     } catch (error) {
         const warningMessage = `Input normalization failed: ${error.message}`;
         log.warning(warningMessage);
@@ -744,6 +981,7 @@ await Actor.main(async () => {
         const candidate = baseSearchCandidates[candidateIndex];
         let discoveredTotalPages = Number.POSITIVE_INFINITY;
         let savedByCandidate = 0;
+        const sessionState = {};
         const candidateLabel = `${candidateIndex + 1}/${baseSearchCandidates.length}`;
         for (let pageNumber = 1; pageNumber <= maxPages && pageNumber <= discoveredTotalPages; pageNumber++) {
             if (totalSaved >= resultsWanted) break;
@@ -757,13 +995,19 @@ await Actor.main(async () => {
                     proxyConfiguration,
                     maxAttempts: fetchAttempts,
                     sessionPrefix: `mobilede_${candidateIndex + 1}_page_${pageNumber}`,
+                    sessionState,
                 });
+
                 state = fetched.state;
+                sessionState.client = fetched.sessionState.client;
+                sessionState.proxyUrl = fetched.sessionState.proxyUrl;
                 if (pageNumber === 1) log.info(`Source selected | ${fetched.mode}`);
             } catch (error) {
                 const warning = `Page fetch failed for candidate ${candidateLabel} page ${pageNumber}: ${error.message}`;
                 runWarnings.push(warning);
                 log.warning(warning);
+                sessionState.client = undefined;
+                sessionState.proxyUrl = undefined;
                 if (totalSaved === 0) {
                     log.warning('Initial page could not be fetched; stopping because no valid listings are available to continue from.');
                     break;

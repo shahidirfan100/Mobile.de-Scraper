@@ -72,37 +72,53 @@ Each dataset item represents one vehicle listing. The actor keeps a field when M
 
 ## How to scrape Mobile.de data
 
-1. Open Mobile.de and create a search with the filters you need.
-2. Copy the complete public search results URL from the browser address bar.
-3. Open this Actor on Apify and paste the URL into `startUrl`.
+1. Open Mobile.de and create a search with the filters you need, or start with a basic search URL.
+2. Copy a public Mobile.de search results URL into `startUrl`.
+3. Optionally fill in `location`, `make`, `model`, `year`, `price`, and `country` below the URL.
 4. Set `results_wanted` and `max_pages` for the size of the collection.
 5. Run the Actor and review the dataset preview.
 6. Download the results or connect the dataset to your workflow.
 
-The actor accepts Mobile.de hosts such as `suchen.mobile.de`, `www.mobile.de`, and `m.mobile.de`. It preserves the filters in the supplied URL and adds the required pagination values while collecting results. A valid Mobile.de search URL is required; the local `INPUT.json` file only provides a development fallback.
+The actor accepts Mobile.de hosts such as `suchen.mobile.de`, `www.mobile.de`, and `m.mobile.de`. It preserves URL filters when the matching option is omitted, and an explicit option overrides only that filter. It adds the required pagination values while collecting results. A valid Mobile.de search URL is required; the local `INPUT.json` file only provides a development fallback.
 
 ## Input Parameters
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `startUrl` | String | Yes | - | Complete public Mobile.de search results URL. The URL may include make, model, price, mileage, location, fuel, category, and sorting filters. |
+| `startUrl` | String | Yes | - | Public Mobile.de search results URL. Existing URL filters are preserved unless the corresponding option below is provided. |
+| `location` | String | No | - | City or postal code, such as `Berlin` or `10115`. Uses Mobile.de's `gn` location filter. |
+| `make` | String | No | - | Mobile.de make ID for exact filtering, such as `3500` for BMW. Text names such as `BMW` use Mobile.de's full-text fallback. |
+| `model` | String | No | - | Mobile.de model ID used with a numeric make ID, such as `10` for BMW 320. Text names use the full-text fallback. |
+| `year` | String | No | - | First-registration year or range: `2020`, `2020:2024`, `:2024`, or `2020:`. |
+| `price` | String | No | - | Gross price in EUR or range: `10000`, `10000:30000`, `:30000`, or `10000:`. |
+| `country` | String | No | - | Seller country ISO code from Mobile.de's supported country selector, such as `DE`, `AT`, `FR`, `GB`, or `US`. |
 | `results_wanted` | Integer | No | `20` | Maximum number of listings to save. Accepted values range from `1` to `2000`. |
 | `max_pages` | Integer | No | `50` | Maximum number of result pages to process. Accepted values range from `1` to `50`; the actor may raise a smaller value when more pages are needed for the requested result count. |
 | `proxyConfiguration` | Object | No | Apify Residential Proxy in Germany on Apify runs | Optional proxy settings. A Germany residential configuration is recommended for larger or repeated collections. |
 
+The `country` selector supports all country codes currently exposed by Mobile.de: `DE`, `EG`, `AL`, `AD`, `ET`, `BE`, `BA`, `BR`, `BG`, `DK`, `EE`, `FO`, `FI`, `FR`, `GR`, `GB`, `IE`, `IS`, `IL`, `IT`, `JP`, `JO`, `CA`, `HR`, `KW`, `LV`, `LB`, `LI`, `LT`, `LU`, `MT`, `MA`, `MK`, `MX`, `MD`, `MC`, `ME`, `NZ`, `NL`, `NG`, `NO`, `OM`, `AT`, `PL`, `PT`, `RO`, `RU`, `SM`, `SA`, `SE`, `CH`, `RS`, `SK`, `SI`, `ES`, `ZA`, `KR`, `TW`, `CZ`, `TN`, `TR`, `UA`, `HU`, `US`, `AE`, `BY`, and `CY`.
+
 ## Usage Examples
 
-### Basic BMW listing collection
+### Filtered BMW listing collection
 
-Collect up to 20 BMW listings from a prepared Mobile.de search URL.
+Collect BMW 320 listings near Berlin, from selected registration years and price range, using Mobile.de's exact make/model IDs.
 
 ```json
 {
-  "startUrl": "https://suchen.mobile.de/fahrzeuge/search.html?dam=false&isSearchRequest=true&ms=3500%3B%3B%3B&ref=homeAISearch&s=Car&userInput=bmw&vc=Car",
+  "startUrl": "https://suchen.mobile.de/fahrzeuge/search.html?isSearchRequest=true&s=Car&vc=Car",
+  "location": "Berlin",
+  "make": "3500",
+  "model": "10",
+  "year": "2020:2024",
+  "price": "10000:30000",
+  "country": "DE",
   "results_wanted": 20,
   "max_pages": 3
 }
 ```
+
+For a broad text search instead of exact IDs, use values such as `"make": "BMW"` and `"model": "320"`. Mobile.de's exact make/model selector uses IDs; the README example uses the IDs currently shown by Mobile.de for BMW and BMW 320.
 
 ### Larger multi-page collection
 
@@ -169,13 +185,15 @@ The following example shows one representative dataset item. Fields that are not
   "city": "Kirkel",
   "postal_code": "66459",
   "country_code": "DE",
-  "image_url": "https://img.classistatic.de/api/v1/mo-prod/images/a1/a1111111-1111-1111-1111-111111111111?rule=mo-160w",
+  "image_url": "https://img.classistatic.de/api/v1/mo-prod/images/a1/a1111111-1111-1111-1111-111111111111?rule=mo-1024",
   "image_urls": [
-    "https://img.classistatic.de/api/v1/mo-prod/images/a1/a1111111-1111-1111-1111-111111111111?rule=mo-160w",
-    "https://img.classistatic.de/api/v1/mo-prod/images/a1/a1111111-1111-1111-1111-111111111111?rule=mo-360w"
+    "https://img.classistatic.de/api/v1/mo-prod/images/a1/a1111111-1111-1111-1111-111111111111?rule=mo-1024",
+    "https://img.classistatic.de/api/v1/mo-prod/images/b2/b2222222-2222-2222-2222-222222222222?rule=mo-200",
+    "https://img.classistatic.de/api/v1/mo-prod/images/c3/c3333333-3333-3333-3333-333333333333?rule=mo-200",
+    "https://img.classistatic.de/api/v1/mo-prod/images/d4/d4444444-4444-4444-4444-444444444444?rule=mo-200"
   ],
-  "collected_images_count": 2,
-  "images_count": 50,
+  "collected_images_count": 4,
+  "images_count": 15,
   "has_video": false,
   "has_electric_engine": false,
   "is_eye_catcher": false,
@@ -193,9 +211,10 @@ The following example shows one representative dataset item. Fields that are not
 - **Use a complete search URL** - Apply all important filters on Mobile.de before copying the results URL.
 - **Start with a small run** - Test 20 listings and a few pages before increasing the collection size.
 - **Preserve the URL** - Keep the same language, category, and filter parameters when comparing scheduled runs.
+- **Use direct filter options** - Omit an option to keep its URL value, or provide `location`, `make`, `model`, `year`, `price`, or `country` to override that filter.
 - **Use residential proxy settings** - Germany residential sessions are recommended for larger collections and repeated monitoring.
 - **Match the limits to the goal** - `results_wanted` controls saved records, while `max_pages` controls how far the search is traversed.
-- **Review source availability** - Seller phones, ratings, financing values, images, and technical fields vary by listing.
+- **Review source availability** - Seller phones, ratings, financing values, technical fields, and search-page preview images vary by listing. `images_count` is Mobile.de's announced total; `collected_images_count` is the number exposed in the search response.
 - **Report changes** - Public marketplace pages can change. Use the Actor Issues tab when a field that was previously available stops appearing.
 
 ## Integrations and Export Formats

@@ -7,9 +7,59 @@
     "startUrl": {
       "title": "Start URL",
       "type": "string",
-      "description": "Mobile.de search URL. If provided, it is used directly.",
+      "description": "Mobile.de search URL. Existing URL filters are preserved unless the matching filter input below is provided.",
       "editor": "textfield",
       "prefill": "https://suchen.mobile.de/fahrzeuge/search.html?dam=false&isSearchRequest=true&ms=3500%3B%3B%3B&ref=homeAISearch&s=Car&userInput=bmw&vc=Car"
+    },
+    "location": {
+      "title": "Location or postal code",
+      "type": "string",
+      "description": "Mobile.de location filter, such as Berlin or 10115. Sent as the gn parameter.",
+      "editor": "textfield",
+      "example": "Berlin"
+    },
+    "make": {
+      "title": "Make",
+      "type": "string",
+      "description": "Mobile.de make ID for exact filtering, such as 3500 for BMW. A text make name is accepted as a full-text fallback.",
+      "editor": "textfield",
+      "example": "3500"
+    },
+    "model": {
+      "title": "Model",
+      "type": "string",
+      "description": "Mobile.de model ID used with a numeric make ID, such as 10 for BMW 320. A text model name is accepted as a full-text fallback.",
+      "editor": "textfield",
+      "example": "10"
+    },
+    "year": {
+      "title": "First registration year",
+      "type": "string",
+      "description": "First-registration year or range in Mobile.de format: 2020, 2020:2024, :2024, or 2020:.",
+      "editor": "textfield",
+      "example": "2020:2024"
+    },
+    "price": {
+      "title": "Price in EUR",
+      "type": "string",
+      "description": "Gross price or price range in EUR in Mobile.de format: 10000, 10000:30000, :30000, or 10000:.",
+      "editor": "textfield",
+      "example": "10000:30000"
+    },
+    "country": {
+      "title": "Seller country",
+      "type": "string",
+      "description": "Mobile.de seller-country filter using one of the supported ISO country codes shown below.",
+      "editor": "select",
+      "enum": [
+        "DE", "EG", "AL", "AD", "ET", "BE", "BA", "BR", "BG", "DK", "EE", "FO",
+        "FI", "FR", "GR", "GB", "IE", "IS", "IL", "IT", "JP", "JO", "CA", "HR",
+        "KW", "LV", "LB", "LI", "LT", "LU", "MT", "MA", "MK", "MX", "MD", "MC",
+        "ME", "NZ", "NL", "NG", "NO", "OM", "AT", "PL", "PT", "RO", "RU", "SM",
+        "SA", "SE", "CH", "RS", "SK", "SI", "ES", "ZA", "KR", "TW", "CZ", "TN",
+        "TR", "UA", "HU", "US", "AE", "BY", "CY"
+      ],
+      "example": "DE"
     },
     "results_wanted": {
       "title": "Maximum number of listings",
@@ -22,13 +72,13 @@
       "example": 20
     },
     "max_pages": {
-      "title": "Maximum number of pages",
+      "title": "Maximum pages",
       "type": "integer",
       "description": "Maximum search-result pages to scan. The actor stops earlier when results_wanted is reached.",
       "minimum": 1,
-      "editor": "number",
       "default": 50,
       "prefill": 3,
+      "editor": "number",
       "example": 3
     },
     "proxyConfiguration": {
