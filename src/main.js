@@ -1039,11 +1039,23 @@ await Actor.main(async () => {
         log.info('Proxy mode | local run without Apify Proxy');
     }
 
-    let totalSaved = 0;
     const seenIds = new Set();
+    const outputBatch = [];
+    const outputBatchSize = 20;
+    let totalSaved = 0;
     let duplicateCount = 0;
     let invalidRecordCount = 0;
     let filterMismatchCount = 0;
+
+    const flushOutputBatch = async (flushRemainder = false) => {
+        while (outputBatch.length >= outputBatchSize || (flushRemainder && outputBatch.length)) {
+            const batchSize = flushRemainder ? outputBatch.length : outputBatchSize;
+            const batch = outputBatch.slice(0, batchSize);
+            await Actor.pushData(batch);
+            outputBatch.splice(0, batch.length);
+            log.info(`Saved batch | count=${batch.length} | total=${totalSaved}/${resultsWanted}`);
+        }
+    };
 
     for (let candidateIndex = 0; candidateIndex < baseSearchCandidates.length; candidateIndex++) {
         if (totalSaved >= resultsWanted) break;
@@ -1083,6 +1095,7 @@ await Actor.main(async () => {
                     log.warning('Initial page could not be fetched; stopping because no valid listings are available to continue from.');
                     break;
                 }
+                await flushOutputBatch(true);
                 log.info(`Continuing to the next page after exhausting retries for page ${pageNumber}.`);
                 continue;
             }
@@ -1153,10 +1166,10 @@ await Actor.main(async () => {
             }
 
             if (pageBatch.length) {
-                await Actor.pushData(pageBatch);
+                outputBatch.push(...pageBatch);
                 totalSaved += pageBatch.length;
                 savedByCandidate += pageBatch.length;
-                log.info(`Saved ${pageBatch.length} listings from page ${pageNumber}. Total: ${totalSaved}/${resultsWanted}`);
+                await flushOutputBatch();
             }
 
             if (searchResults.hasNextPage === false) break;
@@ -1166,6 +1179,8 @@ await Actor.main(async () => {
             log.warning(`Candidate ${candidateLabel} produced no listings. Trying the same filtered URL on the next host.`);
         }
     }
+
+    await flushOutputBatch(true);
 
     if (!totalSaved) {
         const warningMessage = 'No listings were extracted after all auto-healing strategies. Try enabling Apify Proxy or adjust the search URL.';
