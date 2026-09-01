@@ -79,7 +79,7 @@ Each dataset item represents one vehicle listing. The actor keeps a field when M
 5. Run the Actor and review the dataset preview.
 6. Download the results or connect the dataset to your workflow.
 
-The actor accepts Mobile.de hosts such as `suchen.mobile.de`, `www.mobile.de`, and `m.mobile.de`. It preserves URL filters when the matching option is omitted, and an explicit option overrides only that filter. It adds the required pagination values while collecting results. A valid Mobile.de search URL is required; the local `INPUT.json` file only provides a development fallback.
+The actor accepts Mobile.de hosts such as `suchen.mobile.de`, `www.mobile.de`, and `m.mobile.de`. It preserves URL filters when the matching option is omitted, and an explicit option overrides only that filter. Returned records are checked against the filters you provide, so unrelated makes or countries are not included if a marketplace response is broader than requested. The actor continues through additional pages when needed to reach the requested matching count. It adds the required pagination values while collecting results. A valid Mobile.de search URL is required; the local `INPUT.json` file only provides a development fallback.
 
 ## Input Parameters
 
@@ -87,11 +87,11 @@ The actor accepts Mobile.de hosts such as `suchen.mobile.de`, `www.mobile.de`, a
 |-----------|------|----------|---------|-------------|
 | `startUrl` | String | Yes | - | Public Mobile.de search results URL. Existing URL filters are preserved unless the corresponding option below is provided. |
 | `location` | String | No | - | City or postal code, such as `Berlin` or `10115`. Uses Mobile.de's `gn` location filter. |
-| `make` | String | No | - | Mobile.de make ID for exact filtering, such as `3500` for BMW. Text names such as `BMW` use Mobile.de's full-text fallback. |
+| `make` | String | No | `BMW` in the QA prefill | Mobile.de make ID for exact filtering, such as `3500` for BMW. Text names such as `BMW` use Mobile.de's full-text fallback. |
 | `model` | String | No | - | Mobile.de model ID used with a numeric make ID, such as `10` for BMW 320. Text names use the full-text fallback. |
 | `year` | String | No | - | First-registration year or range: `2020`, `2020:2024`, `:2024`, or `2020:`. |
 | `price` | String | No | - | Gross price in EUR or range: `10000`, `10000:30000`, `:30000`, or `10000:`. |
-| `country` | String | No | - | Seller country ISO code from Mobile.de's supported country selector, such as `DE`, `AT`, `FR`, `GB`, or `US`. |
+| `country` | String | No | `DE` in the QA prefill | Seller country ISO code from Mobile.de's supported country selector (`DE` means Germany), such as `DE`, `AT`, `FR`, `GB`, or `US`. |
 | `results_wanted` | Integer | No | `20` | Maximum number of listings to save. Accepted values range from `1` to `2000`. |
 | `max_pages` | Integer | No | `50` | Maximum number of result pages to process. Accepted values range from `1` to `50`; the actor may raise a smaller value when more pages are needed for the requested result count. |
 | `proxyConfiguration` | Object | No | Apify Residential Proxy in Germany on Apify runs | Optional proxy settings. A Germany residential configuration is recommended for larger or repeated collections. |

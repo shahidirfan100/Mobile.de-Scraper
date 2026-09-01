@@ -626,6 +626,75 @@ const normalizeCountryCode = (value) => {
 
 const isNumericId = (value) => typeof value === 'string' && /^\d+$/.test(value);
 
+const normalizeComparableText = (value) => String(value || '').trim().toLocaleLowerCase();
+
+const parseFilterBounds = (value) => {
+    if (value === undefined || value === null || String(value).trim() === '') return null;
+    const parts = String(value).trim().split(':');
+    const minimum = parts[0] ? Number(parts[0]) : Number.NEGATIVE_INFINITY;
+    let maximum = minimum;
+    if (parts.length > 1) maximum = parts[1] ? Number(parts[1]) : Number.POSITIVE_INFINITY;
+    return {minimum, maximum};
+};
+
+const filterListingsByRequestedInputs = (items, {searchUrl, filters = {}}) => {
+    if (!Array.isArray(items) || !items.length) return [];
+
+    const url = new URL(searchUrl);
+    const explicitMake = filters.make === undefined || filters.make === null ? '' : String(filters.make).trim();
+    const explicitModel = filters.model === undefined || filters.model === null ? '' : String(filters.model).trim();
+    const makeFilter = explicitMake && !isNumericId(explicitMake) ? normalizeComparableText(explicitMake) : '';
+    const modelFilter = explicitModel && !isNumericId(explicitModel) ? normalizeComparableText(explicitModel) : '';
+    const countryFilter = normalizeComparableText(filters.country || url.searchParams.get('cn'));
+    const locationFilter = normalizeComparableText(filters.location || url.searchParams.get('gn'));
+    const yearBounds = parseFilterBounds(filters.year || url.searchParams.get('fr'));
+    const priceBounds = parseFilterBounds(filters.price || url.searchParams.get('p'));
+
+    // A standalone make in userInput is safe to validate against the make values
+    // actually present in the response. Generic terms such as "diesel" are not.
+    let inferredMake = makeFilter;
+    if (!inferredMake) {
+        const userInputTokens = normalizeComparableText(url.searchParams.get('userInput'))
+            .split(/\s+/)
+            .filter((token) => token.length >= 2);
+        const responseMakes = new Set(items
+            .map((item) => normalizeComparableText(getLocalizedValue(item?.make)))
+            .filter(Boolean));
+        inferredMake = userInputTokens.find((token) => responseMakes.has(token)) || '';
+    }
+
+    const hasFilters = Boolean(inferredMake || modelFilter || countryFilter || locationFilter || yearBounds || priceBounds);
+    if (!hasFilters) return items;
+
+    return items.filter((item) => {
+        const itemMake = normalizeComparableText(getLocalizedValue(item?.make));
+        const itemModel = normalizeComparableText(getLocalizedValue(item?.model));
+        if (inferredMake && itemMake !== inferredMake) return false;
+        if (modelFilter && itemModel !== modelFilter) return false;
+
+        const itemCountry = normalizeComparableText(item?.attr?.cn);
+        if (countryFilter && itemCountry !== countryFilter) return false;
+
+        if (locationFilter) {
+            const itemLocation = normalizeComparableText(item?.attr?.loc);
+            const itemPostalCode = normalizeComparableText(item?.attr?.z);
+            if (!itemLocation.includes(locationFilter) && !itemPostalCode.includes(locationFilter)) return false;
+        }
+
+        if (yearBounds) {
+            const year = maybeInteger(String(item?.attr?.fr || '').split('/').at(-1));
+            if (year === undefined || year < yearBounds.minimum || year > yearBounds.maximum) return false;
+        }
+
+        if (priceBounds) {
+            const price = maybeNumber(item?.price?.grossAmount ?? item?.price?.grs?.amount);
+            if (price === undefined || price < priceBounds.minimum || price > priceBounds.maximum) return false;
+        }
+
+        return true;
+    });
+};
+
 const applyMakeModelFilters = (url, { make, model }) => {
     const makeValue = make === undefined || make === null ? '' : String(make).trim();
     const modelValue = model === undefined || model === null ? '' : String(model).trim();
@@ -974,16 +1043,18 @@ await Actor.main(async () => {
     const seenIds = new Set();
     let duplicateCount = 0;
     let invalidRecordCount = 0;
+    let filterMismatchCount = 0;
 
     for (let candidateIndex = 0; candidateIndex < baseSearchCandidates.length; candidateIndex++) {
         if (totalSaved >= resultsWanted) break;
 
         const candidate = baseSearchCandidates[candidateIndex];
         let discoveredTotalPages = Number.POSITIVE_INFINITY;
+        let effectiveMaxPages = maxPages;
         let savedByCandidate = 0;
         const sessionState = {};
         const candidateLabel = `${candidateIndex + 1}/${baseSearchCandidates.length}`;
-        for (let pageNumber = 1; pageNumber <= maxPages && pageNumber <= discoveredTotalPages; pageNumber++) {
+        for (let pageNumber = 1; pageNumber <= effectiveMaxPages && pageNumber <= discoveredTotalPages; pageNumber++) {
             if (totalSaved >= resultsWanted) break;
 
             const searchUrl = withPageNumber(candidate.url, pageNumber);
@@ -1018,11 +1089,28 @@ await Actor.main(async () => {
 
             const searchResults = state?.search?.srp?.data?.searchResults || {};
             const rawItems = Array.isArray(searchResults.items) ? searchResults.items : [];
-            const items = collectListingsFromNodes(rawItems);
+            const parsedItems = collectListingsFromNodes(rawItems);
+            const items = filterListingsByRequestedInputs(parsedItems, {
+                searchUrl,
+                filters: {location, make, model, year, price, country},
+            });
             const {searchId} = searchResults;
 
             discoveredTotalPages = toPositiveInt(searchResults.numPages, discoveredTotalPages);
+            if (items.length < parsedItems.length) {
+                filterMismatchCount += parsedItems.length - items.length;
+                const estimatedPages = Math.ceil(resultsWanted / Math.max(items.length, 1));
+                effectiveMaxPages = Math.min(MAX_PAGES, Math.max(effectiveMaxPages, estimatedPages));
+                // A broad response can advertise only its unfiltered page count.
+                // Extend the discovered bound only after semantic filtering proves
+                // that more pages may be needed for the requested matches.
+                discoveredTotalPages = Math.min(
+                    MAX_PAGES,
+                    Math.max(discoveredTotalPages, estimatedPages),
+                );
+            }
             if (!items.length) {
+                if (parsedItems.length && searchResults.hasNextPage !== false) continue;
                 const warning = `No listings parsed for candidate ${candidateLabel} page ${pageNumber}; switching strategy if available.`;
                 runWarnings.push(warning);
                 log.warning(warning);
@@ -1099,5 +1187,5 @@ await Actor.main(async () => {
         log.warning(`Completed with ${runWarnings.length} warning(s). Last warning: ${runWarnings[runWarnings.length - 1]}`);
     }
 
-    log.info(`Quality summary | saved=${totalSaved} | duplicates_removed=${duplicateCount} | invalid_records_skipped=${invalidRecordCount}`);
+    log.info(`Quality summary | saved=${totalSaved} | duplicates_removed=${duplicateCount} | invalid_records_skipped=${invalidRecordCount} | filter_mismatches_removed=${filterMismatchCount}`);
 });

@@ -9,7 +9,7 @@
       "type": "string",
       "description": "Mobile.de search URL. Existing URL filters are preserved unless the matching filter input below is provided.",
       "editor": "textfield",
-      "prefill": "https://suchen.mobile.de/fahrzeuge/search.html?dam=false&isSearchRequest=true&ms=3500%3B%3B%3B&ref=homeAISearch&s=Car&userInput=bmw&vc=Car"
+      "prefill": "https://suchen.mobile.de/fahrzeuge/search.html?dam=false&isSearchRequest=true&cn=DE&ref=homeAISearch&s=Car&userInput=bmw&vc=Car"
     },
     "location": {
       "title": "Location or postal code",
@@ -23,6 +23,7 @@
       "type": "string",
       "description": "Mobile.de make ID for exact filtering, such as 3500 for BMW. A text make name is accepted as a full-text fallback.",
       "editor": "textfield",
+      "prefill": "BMW",
       "example": "3500"
     },
     "model": {
@@ -51,6 +52,7 @@
       "type": "string",
       "description": "Mobile.de seller-country filter using one of the supported ISO country codes shown below.",
       "editor": "select",
+      "prefill": "DE",
       "enum": [
         "DE", "EG", "AL", "AD", "ET", "BE", "BA", "BR", "BG", "DK", "EE", "FO",
         "FI", "FR", "GR", "GB", "IE", "IS", "IL", "IT", "JP", "JO", "CA", "HR",
