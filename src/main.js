@@ -9,6 +9,7 @@ const START_URL_ALLOWED_HOST_SUFFIX = 'mobile.de';
 const MAX_RESULTS_WANTED = 2000;
 const MAX_PAGES = 50;
 const DEFAULT_MAX_PAGES = 50;
+const RUN_TIMEOUT_BUFFER_MS = 30000;
 const RESIDENTIAL_PROXY_GROUP = 'RESIDENTIAL';
 const RESIDENTIAL_PROXY_COUNTRY = 'DE';
 const SUPPORTED_COUNTRY_CODES = new Set([
@@ -36,7 +37,6 @@ const isAllowedStartUrlHost = (hostname) => {
 const makeSoftWarningPayload = ({ warning, warnings = [], startUrl, resultsWanted, maxPages }) => ({
     warning,
     hints: [
-        'Try enabling Apify Proxy with residential groups.',
         'Try a broader startUrl.',
         'Retry later in case of temporary anti-bot challenge.',
     ],
@@ -110,6 +110,18 @@ const loadFallbackInput = async () => {
 const sleep = (ms) => new Promise((resolve) => {
     setTimeout(resolve, ms);
 });
+
+const getRemainingRunTimeMs = () => {
+    const timeoutAtMs = Actor.getEnv().timeoutAt?.getTime();
+    return Number.isFinite(timeoutAtMs) ? timeoutAtMs - Date.now() : Number.POSITIVE_INFINITY;
+};
+
+const makeRunTimeoutError = () => {
+    const error = new Error('Actor timeout is approaching; stop before the platform aborts the run.');
+    error.code = 'ACTOR_TIMEOUT_APPROACHING';
+    return error;
+};
+
 
 const calculateBackoffMs = (attempt, statusCode, wasBlocked = false) => {
     if (statusCode === 429) return Math.min(3000 * attempt, 30000);
@@ -626,74 +638,6 @@ const normalizeCountryCode = (value) => {
 
 const isNumericId = (value) => typeof value === 'string' && /^\d+$/.test(value);
 
-const normalizeComparableText = (value) => String(value || '').trim().toLocaleLowerCase();
-
-const parseFilterBounds = (value) => {
-    if (value === undefined || value === null || String(value).trim() === '') return null;
-    const parts = String(value).trim().split(':');
-    const minimum = parts[0] ? Number(parts[0]) : Number.NEGATIVE_INFINITY;
-    let maximum = minimum;
-    if (parts.length > 1) maximum = parts[1] ? Number(parts[1]) : Number.POSITIVE_INFINITY;
-    return {minimum, maximum};
-};
-
-const filterListingsByRequestedInputs = (items, {searchUrl, filters = {}}) => {
-    if (!Array.isArray(items) || !items.length) return [];
-
-    const url = new URL(searchUrl);
-    const explicitMake = filters.make === undefined || filters.make === null ? '' : String(filters.make).trim();
-    const explicitModel = filters.model === undefined || filters.model === null ? '' : String(filters.model).trim();
-    const makeFilter = explicitMake && !isNumericId(explicitMake) ? normalizeComparableText(explicitMake) : '';
-    const modelFilter = explicitModel && !isNumericId(explicitModel) ? normalizeComparableText(explicitModel) : '';
-    const countryFilter = normalizeComparableText(filters.country || url.searchParams.get('cn'));
-    const locationFilter = normalizeComparableText(filters.location || url.searchParams.get('gn'));
-    const yearBounds = parseFilterBounds(filters.year || url.searchParams.get('fr'));
-    const priceBounds = parseFilterBounds(filters.price || url.searchParams.get('p'));
-
-    // A standalone make in userInput is safe to validate against the make values
-    // actually present in the response. Generic terms such as "diesel" are not.
-    let inferredMake = makeFilter;
-    if (!inferredMake) {
-        const userInputTokens = normalizeComparableText(url.searchParams.get('userInput'))
-            .split(/\s+/)
-            .filter((token) => token.length >= 2);
-        const responseMakes = new Set(items
-            .map((item) => normalizeComparableText(getLocalizedValue(item?.make)))
-            .filter(Boolean));
-        inferredMake = userInputTokens.find((token) => responseMakes.has(token)) || '';
-    }
-
-    const hasFilters = Boolean(inferredMake || modelFilter || countryFilter || locationFilter || yearBounds || priceBounds);
-    if (!hasFilters) return items;
-
-    return items.filter((item) => {
-        const itemMake = normalizeComparableText(getLocalizedValue(item?.make));
-        const itemModel = normalizeComparableText(getLocalizedValue(item?.model));
-        if (inferredMake && itemMake !== inferredMake) return false;
-        if (modelFilter && itemModel !== modelFilter) return false;
-
-        const itemCountry = normalizeComparableText(item?.attr?.cn);
-        if (countryFilter && itemCountry !== countryFilter) return false;
-
-        if (locationFilter) {
-            const itemLocation = normalizeComparableText(item?.attr?.loc);
-            const itemPostalCode = normalizeComparableText(item?.attr?.z);
-            if (!itemLocation.includes(locationFilter) && !itemPostalCode.includes(locationFilter)) return false;
-        }
-
-        if (yearBounds) {
-            const year = maybeInteger(String(item?.attr?.fr || '').split('/').at(-1));
-            if (year === undefined || year < yearBounds.minimum || year > yearBounds.maximum) return false;
-        }
-
-        if (priceBounds) {
-            const price = maybeNumber(item?.price?.grossAmount ?? item?.price?.grs?.amount);
-            if (price === undefined || price < priceBounds.minimum || price > priceBounds.maximum) return false;
-        }
-
-        return true;
-    });
-};
 
 const applyMakeModelFilters = (url, { make, model }) => {
     const makeValue = make === undefined || make === null ? '' : String(make).trim();
@@ -899,15 +843,25 @@ const fetchSearchState = async ({
             // Apify Proxy session IDs allow only word characters, dots, underscores, and tildes.
             const sessionId = `${sessionPrefix}_attempt_${attempt}`.replace(/[^\w.~]/g, '_');
             proxyUrl = proxyConfiguration ? await proxyConfiguration.newUrl(sessionId) : undefined;
+            if (proxyConfiguration && typeof proxyUrl !== 'string') {
+                throw new Error('Proxy configuration did not return a usable session.');
+            }
             impit = proxyUrl
-                ? new Impit({ browser: STRUCTURED_PAGE_BROWSER, ignoreTlsErrors: true, proxyUrl })
-                : new Impit({ browser: STRUCTURED_PAGE_BROWSER, ignoreTlsErrors: true });
+                ? new Impit({ browser: STRUCTURED_PAGE_BROWSER, proxyUrl })
+                : new Impit({ browser: STRUCTURED_PAGE_BROWSER });
         }
 
         for (const target of attempts) {
             try {
+                const remainingRunTimeMs = getRemainingRunTimeMs();
+                if (remainingRunTimeMs <= RUN_TIMEOUT_BUFFER_MS) throw makeRunTimeoutError();
+
+                const requestTimeoutMs = Math.max(
+                    1,
+                    Math.min(45000, remainingRunTimeMs - RUN_TIMEOUT_BUFFER_MS),
+                );
                 const response = await impit.fetch(target.url, {
-                    signal: AbortSignal.timeout(45000),
+                    signal: AbortSignal.timeout(requestTimeoutMs),
                 });
 
                 const responseBody = await response.text();
@@ -915,9 +869,8 @@ const fetchSearchState = async ({
 
                 if (isLikelyBlockedResponse({ body: responseBody, statusCode: response.status })) {
                     attemptWasBlocked = true;
-                    const sample = responseBody.slice(0, 140).replace(/\s+/g, ' ').trim();
                     blockedError = new Error(
-                        `Blocked/challenge response on ${target.mode} (attempt ${attempt}/${maxAttempts}, status ${response.status}${sample ? `, sample: ${sample}` : ''}).`,
+                        `Blocked/challenge response on ${target.mode} (attempt ${attempt}/${maxAttempts}, status ${response.status}).`,
                     );
                     blockedError.isBlocked = true;
                     lastError = blockedError;
@@ -928,17 +881,17 @@ const fetchSearchState = async ({
                 if (searchResults && Array.isArray(searchResults.items)) {
                     return {
                         state: wrapSearchResultsState(searchResults),
-                        mode: `${target.mode}${proxyUrl ? '-residential' : '-direct'}`,
+                        mode: target.mode,
                         sessionState: {client: impit, proxyUrl},
                     };
                 }
 
                 const contentType = String(response.headers.get('content-type') || '').toLowerCase();
-                const sample = responseBody.slice(0, 140).replace(/\s+/g, ' ').trim();
                 lastError = new Error(
-                    `No structured search results on ${target.mode} (attempt ${attempt}/${maxAttempts}, status ${response.status}${contentType ? `, ${contentType}` : ''}${sample ? `, sample: ${sample}` : ''}).`,
+                    `No structured search results on ${target.mode} (attempt ${attempt}/${maxAttempts}, status ${response.status}${contentType ? `, ${contentType}` : ''}).`,
                 );
             } catch (error) {
+                if (error?.code === 'ACTOR_TIMEOUT_APPROACHING') throw error;
                 lastError = error;
                 lastStatusCode = undefined;
             }
@@ -952,7 +905,13 @@ const fetchSearchState = async ({
         if (blockedError) throw blockedError;
     }
 
-    throw new Error(`Unable to fetch structured search data: ${searchUrl}. ${lastError?.message || ''}`.trim());
+    let safeReason = 'request failed';
+    if (lastError?.isBlocked) {
+        safeReason = lastError.message;
+    } else if (lastStatusCode) {
+        safeReason = `last HTTP status ${lastStatusCode}`;
+    }
+    throw new Error(`Unable to fetch structured search data. ${safeReason}`);
 };
 
 
@@ -1007,16 +966,35 @@ await Actor.main(async () => {
     }
 
     const runWarnings = [];
+    let stoppedForTimeout = false;
+    const stopBeforeActorTimeout = () => {
+        if (stoppedForTimeout) return;
+        stoppedForTimeout = true;
+        const warning = 'Actor timeout is approaching; stopping pagination to preserve extracted results.';
+        runWarnings.push(warning);
+        log.warning(warning);
+    };
     const hasCustomProxyUrls = Array.isArray(proxyConfigInput?.proxyUrls) && proxyConfigInput.proxyUrls.length > 0;
-    const shouldUseResidentialProxy = Actor.isAtHome() && !hasCustomProxyUrls;
-    const shouldIgnoreApifyProxyLocally = !Actor.isAtHome() && !hasCustomProxyUrls && proxyConfigInput?.useApifyProxy;
+    const proxyRequested = proxyConfigInput?.useApifyProxy !== false;
+    const shouldUseResidentialProxy = Actor.isAtHome() && !hasCustomProxyUrls && proxyRequested;
+    const shouldIgnoreApifyProxyLocally = !Actor.isAtHome() && !hasCustomProxyUrls && proxyRequested;
     let effectiveProxyConfig;
     if (shouldUseResidentialProxy) {
+        let configuredGroups;
+        if (Array.isArray(proxyConfigInput?.groups) && proxyConfigInput.groups.length) {
+            configuredGroups = proxyConfigInput.groups;
+        } else if (Array.isArray(proxyConfigInput?.apifyProxyGroups) && proxyConfigInput.apifyProxyGroups.length) {
+            configuredGroups = proxyConfigInput.apifyProxyGroups;
+        } else {
+            configuredGroups = [RESIDENTIAL_PROXY_GROUP];
+        }
         effectiveProxyConfig = {
             ...(proxyConfigInput || {}),
             useApifyProxy: true,
-            apifyProxyGroups: [RESIDENTIAL_PROXY_GROUP],
-            countryCode: proxyConfigInput?.countryCode || RESIDENTIAL_PROXY_COUNTRY,
+            groups: configuredGroups,
+            countryCode: proxyConfigInput?.countryCode
+                || proxyConfigInput?.apifyProxyCountry
+                || RESIDENTIAL_PROXY_COUNTRY,
         };
     } else if (!shouldIgnoreApifyProxyLocally) {
         effectiveProxyConfig = proxyConfigInput;
@@ -1025,19 +1003,21 @@ await Actor.main(async () => {
     if (effectiveProxyConfig) {
         try {
             proxyConfiguration = await Actor.createProxyConfiguration(effectiveProxyConfig);
-        } catch (error) {
-            const warning = `Proxy initialization failed: ${error.message}`;
+        } catch {
+            const warning = 'Optional network configuration failed; continuing with the direct request path.';
             runWarnings.push(warning);
             log.warning(warning);
-            if (shouldUseResidentialProxy) throw error;
+            if (shouldUseResidentialProxy) throw new Error('Optional network configuration failed.');
         }
     }
 
-    if (shouldUseResidentialProxy) {
-        log.info(`Proxy mode | Apify Residential | country=${effectiveProxyConfig.countryCode}`);
-    } else if (shouldIgnoreApifyProxyLocally) {
-        log.info('Proxy mode | local run without Apify Proxy');
+    if (shouldUseResidentialProxy && !proxyConfiguration) {
+        const warning = 'Optional network configuration was unavailable; stopping before requests.';
+        runWarnings.push(warning);
+        log.error(warning);
+        throw new Error(warning);
     }
+
 
     const seenIds = new Set();
     const outputBatch = [];
@@ -1045,7 +1025,6 @@ await Actor.main(async () => {
     let totalSaved = 0;
     let duplicateCount = 0;
     let invalidRecordCount = 0;
-    let filterMismatchCount = 0;
 
     const flushOutputBatch = async (flushRemainder = false) => {
         while (outputBatch.length >= outputBatchSize || (flushRemainder && outputBatch.length)) {
@@ -1062,12 +1041,16 @@ await Actor.main(async () => {
 
         const candidate = baseSearchCandidates[candidateIndex];
         let discoveredTotalPages = Number.POSITIVE_INFINITY;
-        let effectiveMaxPages = maxPages;
+        const effectiveMaxPages = maxPages;
         let savedByCandidate = 0;
         const sessionState = {};
         const candidateLabel = `${candidateIndex + 1}/${baseSearchCandidates.length}`;
         for (let pageNumber = 1; pageNumber <= effectiveMaxPages && pageNumber <= discoveredTotalPages; pageNumber++) {
             if (totalSaved >= resultsWanted) break;
+            if (getRemainingRunTimeMs() <= RUN_TIMEOUT_BUFFER_MS) {
+                stopBeforeActorTimeout();
+                break;
+            }
 
             const searchUrl = withPageNumber(candidate.url, pageNumber);
 
@@ -1086,7 +1069,12 @@ await Actor.main(async () => {
                 sessionState.proxyUrl = fetched.sessionState.proxyUrl;
                 if (pageNumber === 1) log.info(`Source selected | ${fetched.mode}`);
             } catch (error) {
-                const warning = `Page fetch failed for candidate ${candidateLabel} page ${pageNumber}: ${error.message}`;
+                if (error?.code === 'ACTOR_TIMEOUT_APPROACHING') {
+                    stopBeforeActorTimeout();
+                    break;
+                }
+
+                const warning = `Page fetch failed for candidate ${candidateLabel} page ${pageNumber}; request attempts exhausted.`;
                 runWarnings.push(warning);
                 log.warning(warning);
                 sessionState.client = undefined;
@@ -1102,31 +1090,15 @@ await Actor.main(async () => {
 
             const searchResults = state?.search?.srp?.data?.searchResults || {};
             const rawItems = Array.isArray(searchResults.items) ? searchResults.items : [];
-            const parsedItems = collectListingsFromNodes(rawItems);
-            const items = filterListingsByRequestedInputs(parsedItems, {
-                searchUrl,
-                filters: {location, make, model, year, price, country},
-            });
+            const items = collectListingsFromNodes(rawItems);
             const {searchId} = searchResults;
 
             discoveredTotalPages = toPositiveInt(searchResults.numPages, discoveredTotalPages);
-            if (items.length < parsedItems.length) {
-                filterMismatchCount += parsedItems.length - items.length;
-                const estimatedPages = Math.ceil(resultsWanted / Math.max(items.length, 1));
-                effectiveMaxPages = Math.min(MAX_PAGES, Math.max(effectiveMaxPages, estimatedPages));
-                // A broad response can advertise only its unfiltered page count.
-                // Extend the discovered bound only after semantic filtering proves
-                // that more pages may be needed for the requested matches.
-                discoveredTotalPages = Math.min(
-                    MAX_PAGES,
-                    Math.max(discoveredTotalPages, estimatedPages),
-                );
-            }
             if (!items.length) {
-                if (parsedItems.length && searchResults.hasNextPage !== false) continue;
                 const warning = `No listings parsed for candidate ${candidateLabel} page ${pageNumber}; switching strategy if available.`;
                 runWarnings.push(warning);
                 log.warning(warning);
+                if (searchResults.hasNextPage !== false) continue;
                 break;
             }
 
@@ -1175,6 +1147,8 @@ await Actor.main(async () => {
             if (searchResults.hasNextPage === false) break;
         }
 
+        if (stoppedForTimeout) break;
+
         if (savedByCandidate === 0 && candidateIndex < baseSearchCandidates.length - 1) {
             log.warning(`Candidate ${candidateLabel} produced no listings. Trying the same filtered URL on the next host.`);
         }
@@ -1183,7 +1157,7 @@ await Actor.main(async () => {
     await flushOutputBatch(true);
 
     if (!totalSaved) {
-        const warningMessage = 'No listings were extracted after all auto-healing strategies. Try enabling Apify Proxy or adjust the search URL.';
+        const warningMessage = 'No listings were extracted after all auto-healing strategies. Adjust the search URL or retry later.';
         if (FAIL_ON_EMPTY_RESULTS_INTERNAL) {
             throw new Error(warningMessage);
         }
@@ -1202,5 +1176,5 @@ await Actor.main(async () => {
         log.warning(`Completed with ${runWarnings.length} warning(s). Last warning: ${runWarnings[runWarnings.length - 1]}`);
     }
 
-    log.info(`Quality summary | saved=${totalSaved} | duplicates_removed=${duplicateCount} | invalid_records_skipped=${invalidRecordCount} | filter_mismatches_removed=${filterMismatchCount}`);
+    log.info(`Quality summary | saved=${totalSaved} | duplicates_removed=${duplicateCount} | invalid_records_skipped=${invalidRecordCount}`);
 });

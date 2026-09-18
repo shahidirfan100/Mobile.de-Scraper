@@ -2,7 +2,7 @@
 
 Mobile.de Vehicle Scraper is a Mobile.de scraper that collects public vehicle listings from a Mobile.de search results URL. Paste a complete filtered search URL into `startUrl`, choose the number of listings and pages to process, and receive structured records with vehicle specifications, prices, seller details, images, financing information, locations, and direct listing URLs.
 
-Use the dataset for automotive market research, price comparison, dealer inventory monitoring, vehicle sourcing, lead generation, and recurring market snapshots. The filters already saved in your Mobile.de search URL determine which makes, models, locations, prices, mileage ranges, fuel types, and vehicle categories are collected.
+Use the dataset for automotive market research, price comparison, dealer inventory monitoring, vehicle sourcing, lead generation, and recurring market snapshots. The filters saved in your Mobile.de search URL, plus any structured options supplied to the actor, are written into the request before listings are fetched.
 
 ## Why use Mobile.de Vehicle Scraper?
 
@@ -79,7 +79,7 @@ Each dataset item represents one vehicle listing. The actor keeps a field when M
 5. Run the Actor and review the dataset preview.
 6. Download the results or connect the dataset to your workflow.
 
-The actor accepts Mobile.de hosts such as `suchen.mobile.de`, `www.mobile.de`, and `m.mobile.de`. It preserves URL filters when the matching option is omitted, and an explicit option overrides only that filter. Returned records are checked against the filters you provide, so unrelated makes or countries are not included if a marketplace response is broader than requested. The actor continues through additional pages when needed to reach the requested matching count. It adds the required pagination values while collecting results. A valid Mobile.de search URL is required; the local `INPUT.json` file only provides a development fallback.
+The actor accepts Mobile.de hosts such as `suchen.mobile.de`, `www.mobile.de`, and `m.mobile.de`. It preserves URL filters when the matching option is omitted, and an explicit option overrides only that filter. It builds the final search URL before pagination, including location, make, model, year, price, and country options. The response parser keeps only valid vehicle listings, while Mobile.de performs the search filtering. The actor continues through the returned result pages until the requested count is reached. It adds the required pagination values while collecting results. A valid Mobile.de search URL is required; the local `INPUT.json` file only provides a development fallback.
 
 ## Input Parameters
 
