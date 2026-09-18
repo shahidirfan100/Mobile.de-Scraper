@@ -1,18 +1,20 @@
 ## API discovery result
 
-The live discovery process was completed before the rewrite. The target exposes rich listing objects in the server-rendered search response, but the candidate consumer JSON endpoints were not replayable reliably without a browser session.
+The actor needs the server-rendered Mobile.de search response because the consumer JSON endpoints were not replayable reliably. The selected flow uses Impit's verified `ios18` request profile and extracts the structured `searchResults`/Next.js Flight payload instead of scraping visible card text.
 
 ### Selected source
 
 - Endpoint: `https://suchen.mobile.de/fahrzeuge/search.html?...`
-- Method: `GET`
+- Method: `GET` through Impit `browser: 'ios18'`
 - Auth: None for the structured search response
+- Request targets: `m.mobile.de` first, then canonical `suchen.mobile.de` when the first host is challenged or unavailable
+- Proxy: Apify Residential with `DE` routing by default on Apify runs; one Impit client and proxy session are reused across successful sequential pages
+- Retry policy: bounded page-local retries; a challenged page creates a fresh Impit client and residential proxy session before retrying the same filtered URL
 - Pagination: `pageNumber=<n>`; the response also includes `page`, `numPages`, and `hasNextPage`
 - Response marker: `searchResults` containing an `items` array in the legacy payload or a `listings` array in the current Next.js Flight payload
 - Fields available: listing ID, title parts, make, model, category, type, price, vehicle attributes, seller/contact data, financing, image metadata, and pagination metadata
 - Image URL location: current `searchResults.listings` objects expose `numImages`, while matching Next.js Flight `top-result-listing-*`, `base-result-listing-*`, or `tic-result-listing-*` components expose a primary image and, for some cards, up to three `thumbnail-*` `src` props keyed by the same `listingId`
-- Image URL format: search-page primary images use `https://img.classistatic.de/api/v1/mo-prod/images/<prefix>/<uuid>?rule=mo-1024`; preview thumbnails use `?rule=mo-200`. Detail-page galleries may use `mo-1600`, but the actor does not fetch detail pages automatically.
-- Current actor output: 45 non-empty listing fields across the BMW QA sample, with fields omitted when the source does not provide a value
+- Current actor output: the existing 45-field listing contract is preserved; null and empty values are omitted
 
 ### Confirmed search filters
 
@@ -26,42 +28,48 @@ The current Mobile.de search UI exposes these query parameters, verified against
 | `price` | `p` | EUR value or `MIN:MAX` range | Live page accepted `10000:30000` |
 | `country` | `cn` | ISO country code from Mobile.de's selector | Live selector exposed the full code list used by the schema |
 
-The actor builds the request URL from the supplied start URL and explicit filters before fetching each page. Exact make/model matching requires Mobile.de numeric IDs; text values use the service's full-text `userInput` parameter. Location, year, price, and country are written to their validated Mobile.de query parameters before pagination begins.
+### Verified make catalog
 
-The actor uses only the selected structured search-page method. It preserves the complete user-provided URL, builds explicit filters into that URL before pagination, tries the validated mobile host before the canonical host, and rotates a new residential proxy session for each retry on Apify. Impit uses the validated `ios18` profile with its generated, internally consistent browser headers and TLS fingerprint. Temporary challenges are recovered with bounded retries and fresh residential sessions. Parsed records are checked for a valid listing ID and title before they are saved; search filtering is performed by the constructed Mobile.de URL. The actor does not use browser automation, call the rejected consumer endpoints, scrape DOM selectors, or infer values from rendered text.
+The live search page was inspected on 2026-09-18 with the browser session that successfully rendered the search UI. Its `select[name="mk"]` control exposed the complete current make catalog with numeric values, including `Mercedes-Benz=17200`, `Volkswagen=25200`, `BMW=3500`, `Audi=1900`, `Ford=9000`, `Toyota=24100`, `Citroën=5900`, `Kia=13200`, and the remaining selector makes. The exact catalog is stored in `src/mobile-de-makes.js` rather than discovered during every listing page request, so a run does not spend time searching broad pages or depend on a second make-lookup request.
 
-The selected request profile is Impit's supported `ios18` browser emulation. A canonical browser page returned BMW-only results for the tested BMW/Germany URL, while Impit could return HTTP 200 structured HTML from the mobile route without honoring the make term. Chrome emulation returned the same 403 challenge seen in the failed actor run, while Firefox returned a small challenge body without `searchResults`. The actor therefore does not mix a mobile user-agent with Chrome TLS, does not override Impit's generated browser headers, and validates the returned listing fields before saving them.
+The resolver accepts selector names case-insensitively, removes accents, and treats punctuation and spacing variants consistently. It also accepts numeric IDs unchanged and a small set of unambiguous common names such as `Mercedes`, `VW`, `Citroen`, `DS`, and `Ssang Yong`. An unknown text value fails input normalization; it never falls back to `userInput`.
 
-For pagination, `results_wanted` drives the minimum page budget. An old or undersized `max_pages` value is expanded up to the 50-page safety ceiling when it cannot possibly satisfy the requested result count. Pages are requested sequentially in normal browser order, with one Impit client reused across successful pages for connection pooling. A fresh residential proxy session and client are created only after a failed/challenged attempt; successful requests are not artificially delayed. If a later page is challenged after earlier pages succeeded, the actor continues with fresh sessions; if page 1 cannot be fetched, it stops promptly rather than spending the whole run on empty retries.
+A live browser verification with `ms=17200;;;&gn=Berlin&fr=2020:2024&p=10000:30000&cn=DE` displayed `Mercedes-Benz`, `DE, Berlin`, and `14,210 Angebote passend zu deinem Filter`; listing links retained all five parameters. This confirms that the exact make and every structured filter currently exposed by the actor are accepted together by the search page.
 
-The successful direct profile did not require an explicit `Origin`, `Referer`, or `Cookie` header. Mobile.de does set cookies on the HTML response, but direct tests fetched pages 1-3 successfully without an explicit cookie jar. Omitting those headers also avoids sending a referrer for `www.mobile.de` when the requested origin is `suchen.mobile.de` or `m.mobile.de`.
+The actor creates one canonical filtered base URL before the first request. When `startUrl` is omitted, it uses the canonical vehicle search page as the base and applies the structured filters there. Pagination adds only `pageNumber`; it does not rebuild the query, fetch an unfiltered page, or filter broad results locally. Numeric make/model IDs remain supported for other makes and models.
+
+A critical discovery was that `userInput=ford` is not an exact make filter. The live page reported about 1.28 million offers and page 2 contained Mercedes and BMW listings. The exact URL `ms=9000;;;` reported about 82 thousand Ford offers, and browser page 1, page 2, and page 3 each returned Ford-only cards. The actor therefore never uses `userInput` for a structured make. Legacy URLs with `userInput` are converted only when the value matches the verified make catalog; unknown text makes are rejected when supplied through the structured `make` input.
+
+### Browser and pagination decision
+
+The Impit path is selected because the original `ios18` profile produced structured Mobile.de responses in the actor environment while the Patchright Chrome path repeatedly returned HTTP 200 challenge pages. Each filtered page is requested through the same Impit client and proxy session while it succeeds. A failed or challenged page receives a fresh client and proxy session; the actor does not jump over a failed page.
+
+The actor validates the response body and waits for `searchResults` rather than treating HTTP 200 alone as success. It also checks that redirects preserve every requested URL filter before parsing listings.
 
 ### Candidate matrix
 
-| Candidate | Header profile | Result | Fields | Pagination | Decision |
+| Candidate | Profile | Result | Fields | Pagination | Decision |
 |---|---|---:|---:|---|---|
-| `m.mobile.de/consumer/api/search/srp` | Impit Chrome-style HTTP | HTTP 403 challenge | 0 | Unknown | Rejected; blocked |
-| `m.mobile.de/consumer/api/search/srp/items` | Impit Chrome-style HTTP | HTTP 403 challenge | 0 | Unknown | Rejected; blocked |
-| `www.mobile.de/consumer/api/search/srp` | Impit Chrome-style HTTP | HTTP 400 `ApiRequestFailed` | 0 | Unknown | Rejected; required server-side context unavailable |
-| `www.mobile.de/consumer/api/search/srp/items` | Impit Chrome-style HTTP | HTTP 400 API error | 0 | Unknown | Rejected; required server-side context unavailable |
-| Search-page structured `searchResults` | Impit `ios18`, no manual browser headers | HTTP 200, rich payload | 117+ source fields | `pageNumber`, `numPages` | Selected |
-| Search-page Next.js Flight payload | Browser document GET, escaped `self.__next_f.push` state | HTTP 200, `searchResults.listings` | 117+ source fields | `pageNumber` in state | Selected compatibility parser |
-| Search-page structured `searchResults` | Impit `chrome`, no manual overrides | HTTP 403 challenge | 0 | Unknown | Rejected; same block as actor log |
-| Search-page structured `searchResults` | Impit `firefox`, no manual overrides | HTTP 200 challenge body | 0 | Unknown | Rejected; no marker |
-| Search-page structured pages 1-3 | One Impit `ios18` client, no explicit cookies | HTTP 200 structured payload; URL filters applied before fetch | 117+ source fields | `pageNumber`, `numPages` | Validated; cookie jar not required |
-| Search-page via proxy + HTTP/3 | Impit proxy mode with `http3: true` | Unsupported by Impit | Not evaluated | Not evaluated | Rejected; Impit does not support proxies with HTTP/3 |
-| URLScan search-page scan | Public URLScan search | Latest matching scan was HTTP 403 | No usable body | Unknown | Rejected |
-| Search-page Impit `ios18` retry profile | Fresh residential session after challenge | Reuses the validated structured-page flow | 117+ source fields | `pageNumber`, `numPages` | Selected bounded recovery |
-| Search-page Impit `chrome` | Chrome TLS/header profile | HTTP 403 challenge in direct testing | 0 | Unknown | Rejected for this target |
-| Search-page Impit `firefox` | Firefox TLS/header profile | HTTP 200 challenge body without marker | 0 | Unknown | Rejected for this target |
-| Search-page Impit `okhttp` profiles | App-style TLS/header profile | Not a valid profile for the browser structured page | Not evaluated | Not evaluated | Rejected; no app endpoint was selected |
+| `m.mobile.de/consumer/api/search/srp` | Direct Impit request | HTTP 403 challenge | 0 | Unknown | Rejected |
+| `m.mobile.de/consumer/api/search/srp/items` | Direct Impit request | HTTP 403 challenge | 0 | Unknown | Rejected |
+| `www.mobile.de/consumer/api/search/srp` | Direct Impit request | HTTP 400 `ApiRequestFailed` | 0 | Unknown | Rejected |
+| `www.mobile.de/consumer/api/search/srp/items` | Direct Impit request | HTTP 400 API error | 0 | Unknown | Rejected |
+| Search page with `userInput=ford` | Chromium browser | HTTP 200, but broad mixed inventory | Structured data present | Page numbers work but make filter is not exact | Rejected for make filtering |
+| Search page with `ms=9000;;;` | Chromium browser | HTTP 200, Ford-only cards on pages 1–3 | 117+ source fields | `pageNumber`, `numPages`, `hasNextPage` | Selected |
+| Search page with `ms=3500;;;` | Chromium browser | HTTP 200 structured BMW results | 117+ source fields | `pageNumber`, `numPages`, `hasNextPage` | Selected baseline |
+| Search-page structured response | Impit `ios18` | Structured response from the verified actor profile; m.mobile.de and canonical fallback | 117+ source fields | `pageNumber`, `numPages`, `hasNextPage` | Selected |
+| Search-page structured response | Impit `chrome` | HTTP 403 challenge | 0 | Unknown | Rejected |
+| Search-page structured response | Impit `firefox` | HTTP 200 challenge body without marker | 0 | Unknown | Rejected |
+| Search-page structured response | Patchright Chromium | Repeated HTTP 200 challenge pages in the actor runs | 0 on challenge | Unreliable | Rejected |
+| `pageSize=200` URL variation | Chromium browser | Page size remained limited; Mobile.de ignored the value | Normal page fields | Normal pagination still required | Rejected as a shortcut |
 
 ### Discovery notes
 
-1. URLScan public search was checked for `suchen.mobile.de`; the latest matching search-page scan was a 403 response and did not expose a usable JSON network response.
-2. iOS Safari and Android app-style probes were run independently. The iOS page bootstrap returned a large response containing `searchResults`; the Android profile was rejected with 403.
-3. Direct Impit probes of the consumer API candidates returned 403/400. The successful actor path therefore comes from the structured search response, not from the consumer JSON route.
-4. The current response embeds the structured state in escaped Next.js Flight chunks. The parser decodes `self.__next_f.push` payloads, accepts `searchResults.listings`, and normalizes them to the existing `items` contract. Current listing objects expose localized make/model values, `price.grs.amount`, and `contact.phones`; the mapper supports these alongside the legacy fields.
-5. Search response items include inline advertising nodes. The extractor keeps only numeric-ID listings with a usable title, canonicalizes IDs before deduplication, and removes null/empty values recursively.
-6. The actor is HTTP-only and uses Impit's supported `ios18` profile. On a temporary challenge it retries the same filtered URL with a fresh residential session; it also rejects structured responses whose listing fields do not satisfy explicit filters and continues pagination when more matching pages are needed. It does not mix browser profiles or add manually forged browser headers.
-7. The current Flight image props are not part of the listing object itself. The parser associates `top-result-listing-<position>-image-*`, `base-result-listing-<position>-image-*`, and `tic-result-listing-<position>-image` component props with the nearest listing component `listingId`, converts Mobile.de's scheme-relative image source to HTTPS, and adds the appropriate search-page image transformation rule without requesting extra detail pages. Search-page image availability varies by card, so `images_count` can be higher than `collected_images_count`.
+1. Public URLScan search was checked for `suchen.mobile.de`; it did not expose a usable replayable JSON endpoint.
+2. The consumer JSON candidates returned 403/400 responses. The usable data is in the search document's structured state, not the rejected consumer endpoints.
+3. The current response embeds state in escaped `self.__next_f.push` chunks. The parser decodes those chunks, accepts `searchResults.listings`, and normalizes them to the existing `items` contract.
+4. Search response items include inline advertising nodes. The extractor keeps only numeric-ID listings with a usable title, canonicalizes IDs before deduplication, and removes null/empty values recursively.
+5. Flight image props are associated with the nearest listing component by `listingId`; no detail-page request is needed for the existing image fields.
+6. The selected request method is browser navigation, not DOM card scraping. The page is considered usable only when structured data is present and produces valid listing records.
+7. A final Apify run with the actor's residential proxy is still required to confirm the Impit `ios18` path in the production container. Local Windows runs do not reproduce Apify residential proxy access.
+8. The actor now verifies that redirects preserve `ms`, `gn`, `fr`, `p`, and `cn`, and checks returned listing make, country, year, and price values when those response fields are present. A mismatch is treated as a failed page rather than saved as filtered data.

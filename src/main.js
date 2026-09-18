@@ -3,23 +3,22 @@ import { readFile } from 'node:fs/promises';
 import { Actor, log } from 'apify';
 import { Impit } from 'impit';
 
+import { getMobileDeMakeName, normalizeMakeLookupKey } from './mobile-de-makes.js';
+import { getProxyCountry, getProxyGroups, hasCustomProxyUrls, isProxyRequested } from './proxy-config.js';
+import {
+    assertSearchUrlFiltersPreserved,
+    buildBaseSearchUrlCandidates,
+    getExactSearchFilterParameters,
+    SEARCH_PAGE_HOST,
+    withPageNumber,
+} from './search-filters.js';
+
 const STRUCTURED_PAGE_BROWSER = 'ios18';
 const FAIL_ON_EMPTY_RESULTS_INTERNAL = false;
-const START_URL_ALLOWED_HOST_SUFFIX = 'mobile.de';
 const MAX_RESULTS_WANTED = 2000;
 const MAX_PAGES = 50;
 const DEFAULT_MAX_PAGES = 50;
 const RUN_TIMEOUT_BUFFER_MS = 30000;
-const RESIDENTIAL_PROXY_GROUP = 'RESIDENTIAL';
-const RESIDENTIAL_PROXY_COUNTRY = 'DE';
-const SUPPORTED_COUNTRY_CODES = new Set([
-    'DE', 'EG', 'AL', 'AD', 'ET', 'BE', 'BA', 'BR', 'BG', 'DK', 'EE', 'FO',
-    'FI', 'FR', 'GR', 'GB', 'IE', 'IS', 'IL', 'IT', 'JP', 'JO', 'CA', 'HR',
-    'KW', 'LV', 'LB', 'LI', 'LT', 'LU', 'MT', 'MA', 'MK', 'MX', 'MD', 'MC',
-    'ME', 'NZ', 'NL', 'NG', 'NO', 'OM', 'AT', 'PL', 'PT', 'RO', 'RU', 'SM',
-    'SA', 'SE', 'CH', 'RS', 'SK', 'SI', 'ES', 'ZA', 'KR', 'TW', 'CZ', 'TN',
-    'TR', 'UA', 'HU', 'US', 'AE', 'BY', 'CY',
-]);
 
 const toPositiveInt = (value, fallback) => {
     const n = Number(value);
@@ -28,18 +27,9 @@ const toPositiveInt = (value, fallback) => {
 
 const clampInt = (value, minValue, maxValue) => Math.min(Math.max(value, minValue), maxValue);
 
-const isAllowedStartUrlHost = (hostname) => {
-    if (typeof hostname !== 'string' || !hostname.trim()) return false;
-    const normalized = hostname.trim().toLowerCase();
-    return normalized === START_URL_ALLOWED_HOST_SUFFIX || normalized.endsWith(`.${START_URL_ALLOWED_HOST_SUFFIX}`);
-};
-
 const makeSoftWarningPayload = ({ warning, warnings = [], startUrl, resultsWanted, maxPages }) => ({
     warning,
-    hints: [
-        'Try a broader startUrl.',
-        'Retry later in case of temporary anti-bot challenge.',
-    ],
+    hints: ['Try a broader startUrl.', 'Retry later in case of temporary anti-bot challenge.'],
     warnings: warnings.slice(-10),
     inputSummary: {
         hasStartUrl: Boolean(startUrl),
@@ -57,46 +47,6 @@ const persistSoftWarning = async (payload) => {
     }
 };
 
-const tryDecodeUrlText = (value) => {
-    if (typeof value !== 'string') return value;
-    try {
-        return decodeURIComponent(value);
-    } catch {
-        return value;
-    }
-};
-
-const parseInputUrlLoosely = (rawUrl) => {
-    if (typeof rawUrl !== 'string') return null;
-    const trimmed = rawUrl.trim();
-    if (!trimmed) return null;
-
-    const variants = [trimmed, tryDecodeUrlText(trimmed)];
-    const seen = new Set();
-
-    for (const variant of variants) {
-        if (typeof variant !== 'string') continue;
-        const candidate = variant.trim();
-        if (!candidate) continue;
-
-        const prefixed = /^[a-zA-Z][a-zA-Z\d+.-]*:/.test(candidate)
-            ? [candidate]
-            : [`https://${candidate.replace(/^\/+/, '')}`, `https:${candidate}`];
-
-        for (const attempt of prefixed) {
-            if (!attempt || seen.has(attempt)) continue;
-            seen.add(attempt);
-            try {
-                return new URL(attempt);
-            } catch {
-                // continue trying other variants
-            }
-        }
-    }
-
-    return null;
-};
-
 const loadFallbackInput = async () => {
     try {
         const raw = await readFile(new URL('../INPUT.json', import.meta.url), 'utf8');
@@ -107,9 +57,10 @@ const loadFallbackInput = async () => {
     }
 };
 
-const sleep = (ms) => new Promise((resolve) => {
-    setTimeout(resolve, ms);
-});
+const sleep = (ms) =>
+    new Promise((resolve) => {
+        setTimeout(resolve, ms);
+    });
 
 const getRemainingRunTimeMs = () => {
     const timeoutAtMs = Actor.getEnv().timeoutAt?.getTime();
@@ -122,7 +73,6 @@ const makeRunTimeoutError = () => {
     return error;
 };
 
-
 const calculateBackoffMs = (attempt, statusCode, wasBlocked = false) => {
     if (statusCode === 429) return Math.min(3000 * attempt, 30000);
     if (wasBlocked || statusCode === 403 || (statusCode >= 500 && statusCode < 600)) {
@@ -134,7 +84,11 @@ const calculateBackoffMs = (attempt, statusCode, wasBlocked = false) => {
 const maybeNumber = (value) => {
     if (typeof value === 'number' && Number.isFinite(value)) return value;
     if (typeof value !== 'string') return undefined;
-    const normalized = value.replace(/\s/g, '').replace(/\./g, '').replace(',', '.').replace(/[^\d.-]/g, '');
+    const normalized = value
+        .replace(/\s/g, '')
+        .replace(/\./g, '')
+        .replace(',', '.')
+        .replace(/[^\d.-]/g, '');
     if (!normalized) return undefined;
     const number = Number(normalized);
     return Number.isFinite(number) ? number : undefined;
@@ -169,12 +123,7 @@ const getItemTitle = (item) => {
 };
 
 const isRealListingItem = (item) => {
-    return Boolean(
-        item
-        && typeof item === 'object'
-        && maybeInteger(item.id) !== undefined
-        && getItemTitle(item),
-    );
+    return Boolean(item && typeof item === 'object' && maybeInteger(item.id) !== undefined && getItemTitle(item));
 };
 
 const parsePower = (value) => {
@@ -265,9 +214,7 @@ const compactValue = (value) => {
         return trimmed === '' ? undefined : trimmed;
     }
     if (Array.isArray(value)) {
-        const cleaned = value
-            .map((item) => compactValue(item))
-            .filter((item) => item !== undefined);
+        const cleaned = value.map((item) => compactValue(item)).filter((item) => item !== undefined);
         return cleaned.length ? cleaned : undefined;
     }
     if (typeof value === 'object') {
@@ -378,7 +325,7 @@ const getSearchResultItems = (value) => {
 const normalizeSearchResults = (value) => {
     const items = getSearchResultItems(value);
     if (!items) return null;
-    return Array.isArray(value.items) ? value : {...value, items};
+    return Array.isArray(value.items) ? value : { ...value, items };
 };
 
 const isSearchResultsObject = (value) => {
@@ -386,8 +333,9 @@ const isSearchResultsObject = (value) => {
     if (!items) return false;
     if (items.length === 0) return true;
 
-    return items.some((item) => isRealListingItem(item)
-        || (item && typeof item === 'object' && getSearchResultItems(item)));
+    return items.some(
+        (item) => isRealListingItem(item) || (item && typeof item === 'object' && getSearchResultItems(item)),
+    );
 };
 
 const findSearchResultsInNode = (root) => {
@@ -487,11 +435,11 @@ const addFlightImagesToSearchResults = (searchResults, imageMap) => {
                 ...(item.previewImage || {}),
                 src: imageUrls[0],
             },
-            previewThumbnails: imageUrls.slice(1).map((src) => ({src})),
+            previewThumbnails: imageUrls.slice(1).map((src) => ({ src })),
         };
     });
 
-    return {...searchResults, items};
+    return { ...searchResults, items };
 };
 
 const extractSearchResultsFromFlightPayload = (body) => {
@@ -593,123 +541,78 @@ const isLikelyBlockedResponse = ({ body, statusCode }) => {
         'too many requests',
         'sec-if-cpt-container',
     ];
-    const compactChallengeShell = /<body>\s*<script\b[^>]+\bsrc=["'][^"']+["'][^>]*>\s*<\/script>\s*<\/body>/i.test(text);
+    const compactChallengeShell = /<body>\s*<script\b[^>]+\bsrc=["'][^"']+["'][^>]*>\s*<\/script>\s*<\/body>/i.test(
+        text,
+    );
     return compactChallengeShell || markers.some((marker) => text.includes(marker));
 };
 
-const normalizeRangeFilter = (value, name, validatePart) => {
-    if (value === undefined || value === null || String(value).trim() === '') return undefined;
-
-    const raw = String(value).trim().replace(/\s+/g, '');
-    const parts = raw.split(':');
-    if (parts.length > 2 || !raw) {
-        throw new Error(`${name} must be a value or range in the form MIN:MAX.`);
-    }
-
+const parseBounds = (value) => {
+    if (!value) return {};
+    const parts = value.split(':');
     const [minimum, maximum] = parts.length === 2 ? parts : [parts[0], parts[0]];
-    if (!minimum && !maximum) throw new Error(`${name} must contain at least one value.`);
-    if ((minimum && !validatePart(minimum)) || (maximum && !validatePart(maximum))) {
-        throw new Error(`${name} contains an invalid value: ${value}.`);
-    }
-
-    return parts.length === 2 ? `${minimum}:${maximum}` : minimum;
+    return {
+        minimum: minimum ? Number(minimum) : undefined,
+        maximum: maximum ? Number(maximum) : undefined,
+    };
 };
 
-const normalizeYearFilter = (value) => normalizeRangeFilter(
-    value,
-    'year',
-    (part) => /^(?:19|20)\d{2}$/.test(part),
-);
+const getResponseFilterMismatches = ({ items, searchUrl }) => {
+    const filters = getExactSearchFilterParameters(searchUrl);
+    const mismatches = [];
 
-const normalizePriceFilter = (value) => normalizeRangeFilter(
-    value,
-    'price',
-    (part) => /^\d+$/.test(part),
-);
-
-const normalizeCountryCode = (value) => {
-    if (value === undefined || value === null || String(value).trim() === '') return undefined;
-    const countryCode = String(value).trim().toUpperCase();
-    if (!SUPPORTED_COUNTRY_CODES.has(countryCode)) {
-        throw new Error(`country must be one of Mobile.de's supported ISO country codes: ${[...SUPPORTED_COUNTRY_CODES].join(', ')}.`);
-    }
-    return countryCode;
-};
-
-const isNumericId = (value) => typeof value === 'string' && /^\d+$/.test(value);
-
-
-const applyMakeModelFilters = (url, { make, model }) => {
-    const makeValue = make === undefined || make === null ? '' : String(make).trim();
-    const modelValue = model === undefined || model === null ? '' : String(model).trim();
-    if (!makeValue && !modelValue) return;
-
-    if (isNumericId(makeValue) && (!modelValue || isNumericId(modelValue))) {
-        url.searchParams.set('ms', `${makeValue};${modelValue};;`);
-        // userInput is a broad text search and can counteract an exact ms filter.
-        url.searchParams.delete('userInput');
-        return;
-    }
-
-    // Mobile.de's exact make/model selector uses numeric IDs. For text values,
-    // use the service's supported full-text search rather than inventing IDs.
-    url.searchParams.delete('ms');
-    url.searchParams.set('userInput', [makeValue, modelValue].filter(Boolean).join(' '));
-};
-
-const normalizeSearchUrl = (rawUrl, filters = {}) => {
-    try {
-        const url = new URL(rawUrl);
-        url.protocol = 'https:';
-        url.searchParams.set('isSearchRequest', 'true');
-        if (!url.searchParams.has('s')) url.searchParams.set('s', 'Car');
-        if (!url.searchParams.has('vc')) url.searchParams.set('vc', 'Car');
-
-        applyMakeModelFilters(url, filters);
-
-        const optionalFilters = [
-            ['location', 'gn', (value) => String(value).trim()],
-            ['year', 'fr', normalizeYearFilter],
-            ['price', 'p', normalizePriceFilter],
-            ['country', 'cn', normalizeCountryCode],
-        ];
-        for (const [inputName, queryParameter, normalize] of optionalFilters) {
-            const inputValue = filters[inputName];
-            if (inputValue === undefined || inputValue === null || String(inputValue).trim() === '') continue;
-            const normalizedValue = normalize(inputValue);
-            if (normalizedValue) url.searchParams.set(queryParameter, normalizedValue);
+    if (filters.makeId) {
+        const expectedMakeName = getMobileDeMakeName(filters.makeId);
+        const expectedMakeKey = expectedMakeName ? normalizeMakeLookupKey(expectedMakeName) : undefined;
+        const observedMakeKeys = items
+            .map((item) => getLocalizedValue(item?.make))
+            .filter(Boolean)
+            .map((value) => normalizeMakeLookupKey(value));
+        const makeMismatch =
+            expectedMakeKey && observedMakeKeys.length && observedMakeKeys.some((value) => value !== expectedMakeKey);
+        if (makeMismatch) {
+            mismatches.push(`make=${expectedMakeName || filters.makeId}`);
         }
-
-        return url.toString();
-    } catch (error) {
-        if (error instanceof TypeError) return rawUrl;
-        throw error;
-    }
-};
-
-const buildBaseSearchUrlCandidates = ({ startUrl, filters }) => {
-    const parsedStartUrl = parseInputUrlLoosely(startUrl);
-    if (!parsedStartUrl) throw new Error('A valid Mobile.de startUrl is required.');
-    if (!isAllowedStartUrlHost(parsedStartUrl.hostname)) {
-        throw new Error(`startUrl host is not allowed: ${parsedStartUrl.hostname}`);
     }
 
-    return [{
-        url: normalizeSearchUrl(parsedStartUrl.toString(), filters),
-        source: 'user-start-url',
-    }];
-};
+    if (filters.country) {
+        const observedCountries = items
+            .map((item) => (typeof item?.attr?.cn === 'string' ? item.attr.cn.trim().toUpperCase() : undefined))
+            .filter(Boolean);
+        if (observedCountries.length && observedCountries.some((value) => value !== filters.country)) {
+            mismatches.push(`country=${filters.country}`);
+        }
+    }
 
-const withPageNumber = (rawUrl, pageNumber) => {
-    const url = new URL(rawUrl);
-    url.searchParams.set('pageNumber', String(pageNumber));
-    return url.toString();
-};
+    const yearBounds = parseBounds(filters.fr);
+    if (yearBounds.minimum !== undefined || yearBounds.maximum !== undefined) {
+        const observedYears = items
+            .map((item) =>
+                typeof item?.attr?.fr === 'string' ? maybeInteger(item.attr.fr.split('/').at(-1)) : undefined,
+            )
+            .filter((value) => value !== undefined);
+        const yearMismatch = observedYears.some(
+            (value) =>
+                (yearBounds.minimum !== undefined && value < yearBounds.minimum) ||
+                (yearBounds.maximum !== undefined && value > yearBounds.maximum),
+        );
+        if (yearMismatch) mismatches.push(`year=${filters.fr}`);
+    }
 
-const toMobileHostUrl = (rawUrl) => {
-    const url = new URL(rawUrl);
-    url.hostname = 'm.mobile.de';
-    return url.toString();
+    const priceBounds = parseBounds(filters.price);
+    if (priceBounds.minimum !== undefined || priceBounds.maximum !== undefined) {
+        const observedPrices = items
+            .map((item) => maybeNumber(item?.price?.grossAmount ?? item?.price?.grs?.amount))
+            .filter((value) => value !== undefined);
+        const priceMismatch = observedPrices.some(
+            (value) =>
+                (priceBounds.minimum !== undefined && value < priceBounds.minimum) ||
+                (priceBounds.maximum !== undefined && value > priceBounds.maximum),
+        );
+        if (priceMismatch) mismatches.push(`price=${filters.price}`);
+    }
+
+    return mismatches;
 };
 
 const wrapSearchResultsState = (searchResults) => ({
@@ -725,12 +628,12 @@ const wrapSearchResultsState = (searchResults) => ({
 const toListingUrl = (relativeUrl, listingId) => {
     const numericId = maybeInteger(listingId);
     if (numericId) {
-        return `https://suchen.mobile.de/fahrzeuge/details.html?id=${numericId}`;
+        return `https://${SEARCH_PAGE_HOST}/fahrzeuge/details.html?id=${numericId}`;
     }
 
     if (typeof relativeUrl === 'string' && relativeUrl.trim()) {
         try {
-            return new URL(relativeUrl, 'https://suchen.mobile.de').toString();
+            return new URL(relativeUrl, `https://${SEARCH_PAGE_HOST}`).toString();
         } catch {
             // ignored
         }
@@ -742,9 +645,8 @@ const mapSearchItem = ({ item, pageNumber, searchId }) => {
     const power = parsePower(item?.attr?.pw);
     const firstFinancePlan = Array.isArray(item?.financePlans) ? item.financePlans[0] : undefined;
     const imageUrls = collectImageUrls(item);
-    const registrationYear = typeof item?.attr?.fr === 'string'
-        ? maybeInteger(item.attr.fr.split('/').at(-1))
-        : undefined;
+    const registrationYear =
+        typeof item?.attr?.fr === 'string' ? maybeInteger(item.attr.fr.split('/').at(-1)) : undefined;
 
     const mapped = {
         listing_id: item?.id,
@@ -804,10 +706,10 @@ const mapSearchItem = ({ item, pageNumber, searchId }) => {
 
 const isValidMappedRecord = (record) => {
     return Boolean(
-        record
-        && maybeInteger(record.listing_id) !== undefined
-        && typeof record.title === 'string'
-        && record.title.trim(),
+        record &&
+            maybeInteger(record.listing_id) !== undefined &&
+            typeof record.title === 'string' &&
+            record.title.trim(),
     );
 };
 
@@ -821,49 +723,63 @@ const getListingDedupeKey = ({ item, candidateIndex, pageNumber, position }) => 
     return `fallback:${candidateIndex}:${pageNumber}:${position}`;
 };
 
+const toMobileHostUrl = (rawUrl) => {
+    const url = new URL(rawUrl);
+    url.hostname = 'm.mobile.de';
+    return url.toString();
+};
+
 const fetchSearchState = async ({
     searchUrl,
     proxyConfiguration,
     maxAttempts,
     sessionPrefix,
     sessionState = {},
+    usesUnblocker = false,
 }) => {
-    const attempts = [
+    const targets = [
         { mode: 'structured-page-mobile-ios', url: toMobileHostUrl(searchUrl) },
         { mode: 'structured-page-canonical-ios', url: searchUrl },
-    ].filter((target, index, targets) => targets.findIndex((candidate) => candidate.url === target.url) === index);
+    ].filter((target, index, allTargets) => allTargets.findIndex((candidate) => candidate.url === target.url) === index);
+
     let lastError;
     let lastStatusCode;
+
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         let attemptWasBlocked = false;
         let blockedError;
-        let {client: impit, proxyUrl} = sessionState;
+        let { client: impit, proxyUrl } = sessionState;
 
         if (!impit || attempt > 1) {
-            // Apify Proxy session IDs allow only word characters, dots, underscores, and tildes.
-            const sessionId = `${sessionPrefix}_attempt_${attempt}`.replace(/[^\w.~]/g, '_');
+            const sessionId = usesUnblocker
+                ? undefined
+                : `${sessionPrefix}_attempt_${attempt}`.replace(/[^\w.~]/g, '_');
             proxyUrl = proxyConfiguration ? await proxyConfiguration.newUrl(sessionId) : undefined;
             if (proxyConfiguration && typeof proxyUrl !== 'string') {
-                throw new Error('Proxy configuration did not return a usable session.');
+                throw new Error('Proxy configuration did not return a usable request session.');
             }
             impit = proxyUrl
                 ? new Impit({ browser: STRUCTURED_PAGE_BROWSER, proxyUrl })
                 : new Impit({ browser: STRUCTURED_PAGE_BROWSER });
+
+            if (proxyUrl) {
+                log.info(
+                    `Impit request session ready | groups=${getProxyGroups(proxyConfiguration).join(',') || 'automatic'} | country=${getProxyCountry(proxyConfiguration) || 'automatic'} | session=${sessionId ? 'yes' : 'no'}`,
+                );
+            } else {
+                log.info('Impit request session ready | direct connection');
+            }
         }
 
-        for (const target of attempts) {
+        for (const target of targets) {
             try {
                 const remainingRunTimeMs = getRemainingRunTimeMs();
                 if (remainingRunTimeMs <= RUN_TIMEOUT_BUFFER_MS) throw makeRunTimeoutError();
 
-                const requestTimeoutMs = Math.max(
-                    1,
-                    Math.min(45000, remainingRunTimeMs - RUN_TIMEOUT_BUFFER_MS),
-                );
+                const requestTimeoutMs = Math.max(1, Math.min(45000, remainingRunTimeMs - RUN_TIMEOUT_BUFFER_MS));
                 const response = await impit.fetch(target.url, {
                     signal: AbortSignal.timeout(requestTimeoutMs),
                 });
-
                 const responseBody = await response.text();
                 lastStatusCode = response.status;
 
@@ -877,12 +793,13 @@ const fetchSearchState = async ({
                     continue;
                 }
 
+                assertSearchUrlFiltersPreserved({ requestedUrl: searchUrl, actualUrl: response.url || target.url });
                 const searchResults = extractSearchResultsFromStructuredPage(responseBody);
                 if (searchResults && Array.isArray(searchResults.items)) {
                     return {
                         state: wrapSearchResultsState(searchResults),
                         mode: target.mode,
-                        sessionState: {client: impit, proxyUrl},
+                        sessionState: { client: impit, proxyUrl },
                     };
                 }
 
@@ -905,26 +822,18 @@ const fetchSearchState = async ({
         if (blockedError) throw blockedError;
     }
 
-    let safeReason = 'request failed';
-    if (lastError?.isBlocked) {
-        safeReason = lastError.message;
-    } else if (lastStatusCode) {
-        safeReason = `last HTTP status ${lastStatusCode}`;
-    }
+    const safeReason = lastError?.message || (lastStatusCode ? `last HTTP status ${lastStatusCode}` : 'request failed');
     throw new Error(`Unable to fetch structured search data. ${safeReason}`);
 };
-
 
 await Actor.main(async () => {
     const actorInput = await Actor.getInput();
     const actorInputObject = actorInput && typeof actorInput === 'object' ? actorInput : {};
-    const actorInputKeys = Object.keys(actorInputObject);
     const fallbackInput = await loadFallbackInput();
-    const input = { ...fallbackInput, ...actorInputObject };
-
-    if (!actorInputKeys.length) {
-        // INPUT.json fallback is intentional for local/dev runs.
-    }
+    const hasRuntimeInput = actorInput !== null && actorInput !== undefined;
+    const useLocalFallback = !hasRuntimeInput && !Actor.isAtHome();
+    // INPUT.json is a local runner fallback only; never use it for an Apify run.
+    const input = useLocalFallback ? fallbackInput : actorInputObject;
     const {
         startUrl,
         location,
@@ -945,27 +854,32 @@ await Actor.main(async () => {
     const fetchAttempts = 4;
 
     if (maxPages > configuredMaxPages) {
-        log.info(`Pagination cap expanded from ${configuredMaxPages} to ${maxPages} pages for results_wanted=${resultsWanted}.`);
+        log.info(
+            `Pagination cap expanded from ${configuredMaxPages} to ${maxPages} pages for results_wanted=${resultsWanted}.`,
+        );
     }
     let baseSearchCandidates;
     try {
         baseSearchCandidates = buildBaseSearchUrlCandidates({
             startUrl,
-            filters: {location, make, model, year, price, country},
+            filters: { location, make, model, year, price, country },
         });
     } catch (error) {
         const warningMessage = `Input normalization failed: ${error.message}`;
         log.warning(warningMessage);
-        await persistSoftWarning(makeSoftWarningPayload({
-            warning: warningMessage,
-            startUrl,
-            resultsWanted,
-            maxPages,
-        }));
+        await persistSoftWarning(
+            makeSoftWarningPayload({
+                warning: warningMessage,
+                startUrl,
+                resultsWanted,
+                maxPages,
+            }),
+        );
         return;
     }
 
     const runWarnings = [];
+    log.info(`Filtered search URL ready | ${baseSearchCandidates[0].url}`);
     let stoppedForTimeout = false;
     const stopBeforeActorTimeout = () => {
         if (stoppedForTimeout) return;
@@ -974,57 +888,50 @@ await Actor.main(async () => {
         runWarnings.push(warning);
         log.warning(warning);
     };
-    const hasCustomProxyUrls = Array.isArray(proxyConfigInput?.proxyUrls) && proxyConfigInput.proxyUrls.length > 0;
-    const proxyRequested = proxyConfigInput?.useApifyProxy !== false;
-    const shouldUseResidentialProxy = Actor.isAtHome() && !hasCustomProxyUrls && proxyRequested;
-    const shouldIgnoreApifyProxyLocally = !Actor.isAtHome() && !hasCustomProxyUrls && proxyRequested;
-    let effectiveProxyConfig;
-    if (shouldUseResidentialProxy) {
-        let configuredGroups;
-        if (Array.isArray(proxyConfigInput?.groups) && proxyConfigInput.groups.length) {
-            configuredGroups = proxyConfigInput.groups;
-        } else if (Array.isArray(proxyConfigInput?.apifyProxyGroups) && proxyConfigInput.apifyProxyGroups.length) {
-            configuredGroups = proxyConfigInput.apifyProxyGroups;
-        } else {
-            configuredGroups = [RESIDENTIAL_PROXY_GROUP];
-        }
-        effectiveProxyConfig = {
-            ...(proxyConfigInput || {}),
-            useApifyProxy: true,
-            groups: configuredGroups,
-            countryCode: proxyConfigInput?.countryCode
-                || proxyConfigInput?.apifyProxyCountry
-                || RESIDENTIAL_PROXY_COUNTRY,
-        };
-    } else if (!shouldIgnoreApifyProxyLocally) {
-        effectiveProxyConfig = proxyConfigInput;
+    const customProxyUrlsConfigured = hasCustomProxyUrls(proxyConfigInput);
+    const proxyRequested = isProxyRequested(proxyConfigInput);
+    const shouldIgnoreApifyProxyLocally =
+        !Actor.isAtHome() && proxyRequested && !customProxyUrlsConfigured;
+    const effectiveProxyConfig = shouldIgnoreApifyProxyLocally ? undefined : proxyConfigInput;
+
+    if (proxyRequested && shouldIgnoreApifyProxyLocally) {
+        log.info('Local run detected | ignoring Apify Proxy settings; using the direct request path.');
+    } else if (proxyRequested) {
+        log.info(
+            `Proxy requested | groups=${getProxyGroups(effectiveProxyConfig).join(',') || 'automatic'} | country=${getProxyCountry(effectiveProxyConfig) || 'automatic'} | custom=${customProxyUrlsConfigured ? 'yes' : 'no'}`,
+        );
+    } else {
+        log.info('Proxy not configured | using the direct request path.');
     }
+
     let proxyConfiguration;
     if (effectiveProxyConfig) {
         try {
+            // Keep the actor input unchanged. The SDK accepts both runtime keys
+            // and the apifyProxy* aliases emitted by the Apify input editor.
             proxyConfiguration = await Actor.createProxyConfiguration(effectiveProxyConfig);
-        } catch {
-            const warning = 'Optional network configuration failed; continuing with the direct request path.';
-            runWarnings.push(warning);
-            log.warning(warning);
-            if (shouldUseResidentialProxy) throw new Error('Optional network configuration failed.');
+        } catch (error) {
+            const message = customProxyUrlsConfigured
+                ? 'Configured custom proxy could not be initialized.'
+                : 'Configured Apify Proxy could not be initialized; check proxy access and credentials.';
+            log.error(`${message} ${error.message}`);
+            throw new Error(message, { cause: error });
         }
     }
 
-    if (shouldUseResidentialProxy && !proxyConfiguration) {
-        const warning = 'Optional network configuration was unavailable; stopping before requests.';
-        runWarnings.push(warning);
-        log.error(warning);
-        throw new Error(warning);
+    if (proxyRequested && effectiveProxyConfig && Actor.isAtHome() && !proxyConfiguration) {
+        throw new Error('Configured proxy was not available on the Apify platform.');
     }
 
-
+    const usesUnblocker = getProxyGroups(effectiveProxyConfig).includes('UNBLOCKER');
     const seenIds = new Set();
     const outputBatch = [];
     const outputBatchSize = 20;
     let totalSaved = 0;
     let duplicateCount = 0;
     let invalidRecordCount = 0;
+    let pagesFetched = 0;
+    let stopReason = 'not_started';
 
     const flushOutputBatch = async (flushRemainder = false) => {
         while (outputBatch.length >= outputBatchSize || (flushRemainder && outputBatch.length)) {
@@ -1037,7 +944,10 @@ await Actor.main(async () => {
     };
 
     for (let candidateIndex = 0; candidateIndex < baseSearchCandidates.length; candidateIndex++) {
-        if (totalSaved >= resultsWanted) break;
+        if (totalSaved >= resultsWanted) {
+            stopReason = 'result_target_reached';
+            break;
+        }
 
         const candidate = baseSearchCandidates[candidateIndex];
         let discoveredTotalPages = Number.POSITIVE_INFINITY;
@@ -1046,22 +956,26 @@ await Actor.main(async () => {
         const sessionState = {};
         const candidateLabel = `${candidateIndex + 1}/${baseSearchCandidates.length}`;
         for (let pageNumber = 1; pageNumber <= effectiveMaxPages && pageNumber <= discoveredTotalPages; pageNumber++) {
-            if (totalSaved >= resultsWanted) break;
+            if (totalSaved >= resultsWanted) {
+                stopReason = 'result_target_reached';
+                break;
+            }
             if (getRemainingRunTimeMs() <= RUN_TIMEOUT_BUFFER_MS) {
                 stopBeforeActorTimeout();
+                stopReason = 'actor_timeout';
                 break;
             }
 
             const searchUrl = withPageNumber(candidate.url, pageNumber);
-
             let state;
             try {
                 const fetched = await fetchSearchState({
                     searchUrl,
                     proxyConfiguration,
                     maxAttempts: fetchAttempts,
-                    sessionPrefix: `mobilede_${candidateIndex + 1}_page_${pageNumber}`,
+                    sessionPrefix: `mobilede_${candidateIndex + 1}`,
                     sessionState,
+                    usesUnblocker,
                 });
 
                 state = fetched.state;
@@ -1071,27 +985,57 @@ await Actor.main(async () => {
             } catch (error) {
                 if (error?.code === 'ACTOR_TIMEOUT_APPROACHING') {
                     stopBeforeActorTimeout();
+                    stopReason = 'actor_timeout';
                     break;
                 }
-
-                const warning = `Page fetch failed for candidate ${candidateLabel} page ${pageNumber}; request attempts exhausted.`;
-                runWarnings.push(warning);
-                log.warning(warning);
                 sessionState.client = undefined;
                 sessionState.proxyUrl = undefined;
+                stopReason = 'page_fetch_failed';
+                const warning = `Page fetch failed for candidate ${candidateLabel} page ${pageNumber} | url=${searchUrl} | ${error.message}`;
+                runWarnings.push(warning);
+                log.warning(warning);
                 if (totalSaved === 0) {
-                    log.warning('Initial page could not be fetched; stopping because no valid listings are available to continue from.');
+                    log.warning(
+                        'Initial page could not be fetched; stopping because no valid listings are available to continue from.',
+                    );
                     break;
                 }
                 await flushOutputBatch(true);
-                log.info(`Continuing to the next page after exhausting retries for page ${pageNumber}.`);
-                continue;
+                log.warning(
+                    `Stopping pagination after page ${pageNumber} failed; continuing would skip listings from the failed page.`,
+                );
+                break;
             }
 
             const searchResults = state?.search?.srp?.data?.searchResults || {};
+            const reportedPageNumber = maybeInteger(searchResults.pageNumber);
+            if (reportedPageNumber !== undefined && reportedPageNumber !== pageNumber) {
+                throw new Error(
+                    `Structured response page mismatch: requested page ${pageNumber}, received page ${reportedPageNumber}.`,
+                );
+            }
             const rawItems = Array.isArray(searchResults.items) ? searchResults.items : [];
             const items = collectListingsFromNodes(rawItems);
-            const {searchId} = searchResults;
+            const { searchId } = searchResults;
+            const responseFilterMismatches = getResponseFilterMismatches({ items, searchUrl });
+            if (responseFilterMismatches.length) {
+                throw new Error(
+                    `Structured response does not match the exact search filters: ${responseFilterMismatches.join(', ')}.`,
+                );
+            }
+            if (pageNumber === 1) {
+                const exactFilters = getExactSearchFilterParameters(searchUrl);
+                const verifiedFilters = [
+                    exactFilters.ms && `ms=${exactFilters.ms}`,
+                    exactFilters.gn && `gn=${exactFilters.gn}`,
+                    exactFilters.fr && `fr=${exactFilters.fr}`,
+                    exactFilters.price && `p=${exactFilters.price}`,
+                    exactFilters.country && `cn=${exactFilters.country}`,
+                ]
+                    .filter(Boolean)
+                    .join('&');
+                log.info(`Filter response verified | ${verifiedFilters || 'no optional filters'}`);
+            }
 
             discoveredTotalPages = toPositiveInt(searchResults.numPages, discoveredTotalPages);
             if (!items.length) {
@@ -1099,9 +1043,11 @@ await Actor.main(async () => {
                 runWarnings.push(warning);
                 log.warning(warning);
                 if (searchResults.hasNextPage !== false) continue;
+                stopReason = 'no_more_pages';
                 break;
             }
 
+            pagesFetched++;
             const pageBatch = [];
             for (const item of items) {
                 if (totalSaved + pageBatch.length >= resultsWanted) break;
@@ -1144,37 +1090,67 @@ await Actor.main(async () => {
                 await flushOutputBatch();
             }
 
-            if (searchResults.hasNextPage === false) break;
+            if (totalSaved >= resultsWanted) {
+                stopReason = 'result_target_reached';
+                break;
+            }
+            if (searchResults.hasNextPage === false) {
+                stopReason = 'no_more_pages';
+                break;
+            }
         }
 
+        if (
+            stopReason === 'not_started' &&
+            Number.isFinite(discoveredTotalPages) &&
+            pagesFetched >= discoveredTotalPages
+        ) {
+            stopReason = 'no_more_pages';
+        }
         if (stoppedForTimeout) break;
+        if (stopReason !== 'not_started') break;
 
         if (savedByCandidate === 0 && candidateIndex < baseSearchCandidates.length - 1) {
-            log.warning(`Candidate ${candidateLabel} produced no listings. Trying the same filtered URL on the next host.`);
+            log.warning(
+                `Candidate ${candidateLabel} produced no listings. Trying the same filtered URL on the next host.`,
+            );
         }
     }
 
     await flushOutputBatch(true);
 
+    if (stopReason === 'not_started') {
+        if (totalSaved >= resultsWanted) stopReason = 'result_target_reached';
+        else if (pagesFetched >= maxPages) stopReason = 'max_pages_reached';
+        else stopReason = 'completed';
+    }
+
+    log.info(
+        `Run summary | saved=${totalSaved}/${resultsWanted} | pages=${pagesFetched} | stop_reason=${stopReason} | duplicates_removed=${duplicateCount} | invalid_records_skipped=${invalidRecordCount}`,
+    );
+
     if (!totalSaved) {
-        const warningMessage = 'No listings were extracted after all auto-healing strategies. Adjust the search URL or retry later.';
-        if (FAIL_ON_EMPTY_RESULTS_INTERNAL) {
-            throw new Error(warningMessage);
+        const warningMessage =
+            'No listings were extracted after all auto-healing strategies. Adjust the search URL or retry later.';
+        if (FAIL_ON_EMPTY_RESULTS_INTERNAL || stopReason === 'page_fetch_failed' || stopReason === 'actor_timeout') {
+            throw new Error(runWarnings.at(-1) || warningMessage);
         }
         log.warning(warningMessage);
-        await persistSoftWarning(makeSoftWarningPayload({
-            warning: warningMessage,
-            warnings: runWarnings,
-            startUrl,
-            resultsWanted,
-            maxPages,
-        }));
+        await persistSoftWarning(
+            makeSoftWarningPayload({
+                warning: warningMessage,
+                warnings: runWarnings,
+                startUrl,
+                resultsWanted,
+                maxPages,
+            }),
+        );
         return;
     }
 
     if (runWarnings.length) {
-        log.warning(`Completed with ${runWarnings.length} warning(s). Last warning: ${runWarnings[runWarnings.length - 1]}`);
+        log.warning(
+            `Completed with ${runWarnings.length} warning(s). Last warning: ${runWarnings[runWarnings.length - 1]}`,
+        );
     }
-
-    log.info(`Quality summary | saved=${totalSaved} | duplicates_removed=${duplicateCount} | invalid_records_skipped=${invalidRecordCount}`);
 });

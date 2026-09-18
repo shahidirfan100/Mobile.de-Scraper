@@ -7,9 +7,9 @@
     "startUrl": {
       "title": "Start URL",
       "type": "string",
-      "description": "Mobile.de search URL. Existing URL filters are preserved unless the matching filter input below is provided.",
+      "description": "Optional canonical Mobile.de search URL. Existing URL filters are preserved unless the matching filter input below is provided. If omitted, the actor builds the URL from the structured filters.",
       "editor": "textfield",
-      "prefill": "https://suchen.mobile.de/fahrzeuge/search.html?dam=false&isSearchRequest=true&cn=DE&ref=homeAISearch&s=Car&userInput=bmw&vc=Car"
+      "prefill": "https://suchen.mobile.de/fahrzeuge/search.html?dam=false&isSearchRequest=true&cn=DE&ms=3500%3B%3B%3B&s=Car&vc=Car"
     },
     "location": {
       "title": "Location or postal code",
@@ -21,7 +21,7 @@
     "make": {
       "title": "Make",
       "type": "string",
-      "description": "Mobile.de make ID for exact filtering, such as 3500 for BMW. A text make name is accepted as a full-text fallback.",
+      "description": "Mobile.de make name or numeric ID for exact filtering. All current makes exposed by the Mobile.de selector are converted to their verified numeric URL ID, including BMW (3500), Ford (9000), Audi (1900), Mercedes-Benz (17200), Volkswagen (25200), and Toyota (24100).",
       "editor": "textfield",
       "prefill": "BMW",
       "example": "3500"
@@ -29,7 +29,7 @@
     "model": {
       "title": "Model",
       "type": "string",
-      "description": "Mobile.de model ID used with a numeric make ID, such as 10 for BMW 320. A text model name is accepted as a full-text fallback.",
+      "description": "Mobile.de model ID used with a numeric make ID, such as 10 for BMW 320.",
       "editor": "textfield",
       "example": "10"
     },
@@ -86,11 +86,12 @@
     "proxyConfiguration": {
       "title": "Proxy configuration",
       "type": "object",
-      "description": "Use Apify Residential Proxy with Germany routing for reliable pagination.",
+      "description": "Use a residential browser session with Germany routing for reliable filtered pagination.",
       "editor": "proxy",
       "default": {
         "useApifyProxy": true,
-        "apifyProxyGroups": ["RESIDENTIAL"]
+        "apifyProxyGroups": ["RESIDENTIAL"],
+        "apifyProxyCountry": "DE"
       }
     }
   },

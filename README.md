@@ -1,6 +1,6 @@
 ## What does Mobile.de Vehicle Scraper do?
 
-Mobile.de Vehicle Scraper is a Mobile.de scraper that collects public vehicle listings from a Mobile.de search results URL. Paste a complete filtered search URL into `startUrl`, choose the number of listings and pages to process, and receive structured records with vehicle specifications, prices, seller details, images, financing information, locations, and direct listing URLs.
+Mobile.de Vehicle Scraper is a Mobile.de scraper that collects public vehicle listings from a Mobile.de search results URL or structured vehicle filters. Paste a complete filtered search URL into `startUrl`, or provide filters such as make and country, choose the number of listings and pages to process, and receive structured records with vehicle specifications, prices, seller details, images, financing information, locations, and direct listing URLs.
 
 Use the dataset for automotive market research, price comparison, dealer inventory monitoring, vehicle sourcing, lead generation, and recurring market snapshots. The filters saved in your Mobile.de search URL, plus any structured options supplied to the actor, are written into the request before listings are fetched.
 
@@ -72,23 +72,23 @@ Each dataset item represents one vehicle listing. The actor keeps a field when M
 
 ## How to scrape Mobile.de data
 
-1. Open Mobile.de and create a search with the filters you need, or start with a basic search URL.
-2. Copy a public Mobile.de search results URL into `startUrl`.
-3. Optionally fill in `location`, `make`, `model`, `year`, `price`, and `country` below the URL.
+1. Open Mobile.de and create a search with the filters you need, or use the structured filter fields below.
+2. Optionally copy a public Mobile.de search results URL into `startUrl`. If omitted, the actor starts from the canonical Mobile.de vehicle search page.
+3. Fill in `location`, `make`, `model`, `year`, `price`, and `country` when you want the actor to build the filtered URL.
 4. Set `results_wanted` and `max_pages` for the size of the collection.
 5. Run the Actor and review the dataset preview.
 6. Download the results or connect the dataset to your workflow.
 
-The actor accepts Mobile.de hosts such as `suchen.mobile.de`, `www.mobile.de`, and `m.mobile.de`. It preserves URL filters when the matching option is omitted, and an explicit option overrides only that filter. It builds the final search URL before pagination, including location, make, model, year, price, and country options. The response parser keeps only valid vehicle listings, while Mobile.de performs the search filtering. The actor continues through the returned result pages until the requested count is reached. It adds the required pagination values while collecting results. A valid Mobile.de search URL is required; the local `INPUT.json` file only provides a development fallback.
+The actor accepts Mobile.de hosts such as `suchen.mobile.de`, `www.mobile.de`, and `m.mobile.de`, then normalizes the request to the canonical `suchen.mobile.de` search page. If `startUrl` is omitted, it starts from the canonical vehicle search page and builds one filtered search URL before the first request, including location, make, model, year, price, and country options. Make names are matched case-insensitively, accents and punctuation are normalized, and every current make exposed by Mobile.de's selector is converted to its numeric `ms` ID before fetching. For example, BMW becomes `ms=3500;;;`, Ford `ms=9000;;;`, Audi `ms=1900;;;`, Mercedes-Benz `ms=17200;;;`, Volkswagen `ms=25200;;;`, and Toyota `ms=24100;;;`. Numeric make and model IDs remain supported. Unknown text makes are rejected instead of becoming a broad text search. The same filtered URL is reused for pagination, with only `pageNumber` changing; the actor does not fetch broad pages and filter listings afterward. The structured result payload is read from each filtered search page while the same residential proxy session is reused across successful pages. If a page returns a challenge instead of structured results, the actor starts a fresh session, retries that page, and stops safely if it still cannot be fetched. The local `INPUT.json` file only provides a development fallback.
 
 ## Input Parameters
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `startUrl` | String | Yes | - | Public Mobile.de search results URL. Existing URL filters are preserved unless the corresponding option below is provided. |
+| `startUrl` | String | No | Canonical vehicle search page | Optional public Mobile.de search results URL. Existing URL filters are preserved unless the corresponding option below is provided. If omitted, the actor builds the URL from the structured filters. |
 | `location` | String | No | - | City or postal code, such as `Berlin` or `10115`. Uses Mobile.de's `gn` location filter. |
-| `make` | String | No | `BMW` in the QA prefill | Mobile.de make ID for exact filtering, such as `3500` for BMW. Text names such as `BMW` use Mobile.de's full-text fallback. |
-| `model` | String | No | - | Mobile.de model ID used with a numeric make ID, such as `10` for BMW 320. Text names use the full-text fallback. |
+| `make` | String | No | `BMW` in the QA prefill | Any current Mobile.de make name or its numeric ID. Names are normalized and converted to exact `ms` filters; for example, BMW is `3500`, Ford is `9000`, Audi is `1900`, Mercedes-Benz is `17200`, Volkswagen is `25200`, and Toyota is `24100`. |
+| `model` | String | No | - | Numeric Mobile.de model ID used with a numeric make ID, such as `10` for BMW 320. |
 | `year` | String | No | - | First-registration year or range: `2020`, `2020:2024`, `:2024`, or `2020:`. |
 | `price` | String | No | - | Gross price in EUR or range: `10000`, `10000:30000`, `:30000`, or `10000:`. |
 | `country` | String | No | `DE` in the QA prefill | Seller country ISO code from Mobile.de's supported country selector (`DE` means Germany), such as `DE`, `AT`, `FR`, `GB`, or `US`. |
@@ -118,7 +118,7 @@ Collect BMW 320 listings near Berlin, from selected registration years and price
 }
 ```
 
-For a broad text search instead of exact IDs, use values such as `"make": "BMW"` and `"model": "320"`. Mobile.de's exact make/model selector uses IDs; the README example uses the IDs currently shown by Mobile.de for BMW and BMW 320.
+For exact results, use a make name or numeric ID; both produce the same exact filter. For example, `"make": "BMW"` and `"make": "3500"` produce `ms=3500;;;`, while `"make": "Mercedes Benz"` produces `ms=17200;;;`. For an exact BMW 320 search, use `"make": "BMW"` and `"model": "10"`. Mobile.de's exact model selector uses numeric IDs, while make names are resolved automatically from the current make catalog.
 
 ### Larger multi-page collection
 
@@ -126,13 +126,13 @@ Increase both limits when building a larger inventory dataset from the same save
 
 ```json
 {
-  "startUrl": "https://suchen.mobile.de/fahrzeuge/search.html?dam=false&isSearchRequest=true&ms=3500%3B%3B%3B&ref=homeAISearch&s=Car&userInput=bmw&vc=Car",
+  "startUrl": "https://suchen.mobile.de/fahrzeuge/search.html?dam=false&isSearchRequest=true&ms=3500%3B%3B%3B&ref=homeAISearch&s=Car&vc=Car",
   "results_wanted": 100,
   "max_pages": 10,
   "proxyConfiguration": {
     "useApifyProxy": true,
     "apifyProxyGroups": ["RESIDENTIAL"],
-    "countryCode": "DE"
+    "apifyProxyCountry": "DE"
   }
 }
 ```
@@ -149,7 +149,7 @@ Create the model, price, mileage, and location filters on Mobile.de first, then 
   "proxyConfiguration": {
     "useApifyProxy": true,
     "apifyProxyGroups": ["RESIDENTIAL"],
-    "countryCode": "DE"
+    "apifyProxyCountry": "DE"
   }
 }
 ```

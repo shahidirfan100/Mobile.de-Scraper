@@ -13,7 +13,7 @@
     "format:check": "prettier --check .",
     "lint": "eslint",
     "lint:fix": "eslint --fix",
-    "test": "echo \"No tests specified\""
+    "test": "node --test"
   },
   "author": "Shahid Irfan",
   "license": "ISC",

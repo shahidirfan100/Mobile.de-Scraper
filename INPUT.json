@@ -1,12 +1,11 @@
 {
-  "startUrl": "https://suchen.mobile.de/fahrzeuge/search.html?dam=false&isSearchRequest=true&cn=DE&ref=homeAISearch&s=Car&userInput=bmw&vc=Car",
-  "make": "BMW",
+  "make": "Mercedes-Benz",
   "country": "DE",
   "results_wanted": 20,
   "max_pages": 3,
   "proxyConfiguration": {
     "useApifyProxy": true,
     "apifyProxyGroups": ["RESIDENTIAL"],
-    "countryCode": "DE"
+    "apifyProxyCountry": "DE"
   }
 }
