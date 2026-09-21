@@ -1,12 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import {
-    getProxyCountry,
-    getProxyGroups,
-    hasCustomProxyUrls,
-    isProxyRequested,
-} from '../src/proxy-config.js';
+import { getProxyCountry, getProxyGroups, hasCustomProxyUrls, isProxyRequested } from '../src/proxy-config.js';
 
 test('reads Apify input-editor proxy aliases without rewriting the input', () => {
     const config = {

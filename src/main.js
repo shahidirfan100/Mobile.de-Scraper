@@ -4,21 +4,24 @@ import { Actor, log } from 'apify';
 import { Impit } from 'impit';
 
 import { getMobileDeMakeName, normalizeMakeLookupKey } from './mobile-de-makes.js';
-import { getProxyCountry, getProxyGroups, hasCustomProxyUrls, isProxyRequested } from './proxy-config.js';
+import { getProxyGroups, hasCustomProxyUrls, isProxyRequested } from './proxy-config.js';
 import {
-    assertSearchUrlFiltersPreserved,
     buildBaseSearchUrlCandidates,
     getExactSearchFilterParameters,
     SEARCH_PAGE_HOST,
     withPageNumber,
 } from './search-filters.js';
 
-const STRUCTURED_PAGE_BROWSER = 'ios18';
+const MOBILE_DE_API_HOST = 'www.mobile.de';
+const MOBILE_DE_API_SEARCH_URL = `https://${MOBILE_DE_API_HOST}/consumer/api/search/srp`;
+const MOBILE_DE_CLIENT_HEADER = 'de.mobile.consumer-webapp';
+const IMPIT_BROWSER = 'chrome124';
 const FAIL_ON_EMPTY_RESULTS_INTERNAL = false;
 const MAX_RESULTS_WANTED = 2000;
 const MAX_PAGES = 50;
 const DEFAULT_MAX_PAGES = 50;
 const RUN_TIMEOUT_BUFFER_MS = 30000;
+const REQUEST_TIMEOUT_MS = 30000;
 
 const toPositiveInt = (value, fallback) => {
     const n = Number(value);
@@ -73,9 +76,9 @@ const makeRunTimeoutError = () => {
     return error;
 };
 
-const calculateBackoffMs = (attempt, statusCode, wasBlocked = false) => {
+const calculateBackoffMs = (attempt, statusCode) => {
     if (statusCode === 429) return Math.min(3000 * attempt, 30000);
-    if (wasBlocked || statusCode === 403 || (statusCode >= 500 && statusCode < 600)) {
+    if (statusCode === 400 || statusCode === 403 || (statusCode >= 500 && statusCode < 600)) {
         return Math.min(2000 * attempt, 15000);
     }
     return 250 * attempt + Math.floor(Math.random() * 300);
@@ -228,93 +231,6 @@ const compactValue = (value) => {
     return value;
 };
 
-const extractInitialState = (html) => {
-    const markerMatch = html.match(/window\.__INITIAL_STATE__\s*=\s*/i);
-    if (!markerMatch) return null;
-
-    let jsonStart = markerMatch.index + markerMatch[0].length;
-    while (jsonStart < html.length && /\s/.test(html[jsonStart])) jsonStart++;
-    if (html[jsonStart] !== '{') return null;
-
-    let depth = 0;
-    let inString = false;
-    let escaped = false;
-
-    for (let i = jsonStart; i < html.length; i++) {
-        const char = html[i];
-
-        if (inString) {
-            if (escaped) escaped = false;
-            else if (char === '\\') escaped = true;
-            else if (char === '"') inString = false;
-            continue;
-        }
-
-        if (char === '"') {
-            inString = true;
-            continue;
-        }
-        if (char === '{') depth++;
-        if (char === '}') {
-            depth--;
-            if (depth === 0) {
-                try {
-                    return JSON.parse(html.slice(jsonStart, i + 1));
-                } catch {
-                    return null;
-                }
-            }
-        }
-    }
-
-    return null;
-};
-
-const parseJsonSafely = (raw) => {
-    if (typeof raw !== 'string') return null;
-    try {
-        return JSON.parse(raw);
-    } catch {
-        return null;
-    }
-};
-
-const extractBalancedJson = (source, startIndex) => {
-    if (typeof source !== 'string') return null;
-    const opening = source[startIndex];
-    let closing = null;
-    if (opening === '{') closing = '}';
-    else if (opening === '[') closing = ']';
-    if (!closing) return null;
-
-    let depth = 0;
-    let inString = false;
-    let escaped = false;
-
-    for (let i = startIndex; i < source.length; i++) {
-        const char = source[i];
-
-        if (inString) {
-            if (escaped) escaped = false;
-            else if (char === '\\') escaped = true;
-            else if (char === '"') inString = false;
-            continue;
-        }
-
-        if (char === '"') {
-            inString = true;
-            continue;
-        }
-        if (char === opening) depth++;
-        if (char === closing) {
-            depth--;
-            if (depth === 0) return source.slice(startIndex, i + 1);
-        }
-    }
-
-    return null;
-};
-
 const getSearchResultItems = (value) => {
     if (!value || typeof value !== 'object') return null;
     if (Array.isArray(value.items)) return value.items;
@@ -336,283 +252,6 @@ const isSearchResultsObject = (value) => {
     return items.some(
         (item) => isRealListingItem(item) || (item && typeof item === 'object' && getSearchResultItems(item)),
     );
-};
-
-const findSearchResultsInNode = (root) => {
-    if (!root || typeof root !== 'object') return null;
-
-    const queue = [root];
-    const visited = new WeakSet();
-
-    while (queue.length) {
-        const node = queue.shift();
-        if (!node || typeof node !== 'object' || visited.has(node)) continue;
-        visited.add(node);
-
-        if (isSearchResultsObject(node)) return node;
-
-        const nestedSearchResults = node?.search?.srp?.data?.searchResults;
-        if (isSearchResultsObject(nestedSearchResults)) return nestedSearchResults;
-
-        if (isSearchResultsObject(node.searchResults)) return node.searchResults;
-
-        if (Array.isArray(node)) {
-            for (const child of node) {
-                if (child && typeof child === 'object') queue.push(child);
-            }
-            continue;
-        }
-
-        for (const child of Object.values(node)) {
-            if (child && typeof child === 'object') queue.push(child);
-        }
-    }
-
-    return null;
-};
-
-const extractSearchResultsFromText = (text) => {
-    const markerRegex = /["']searchResults["']\s*:\s*/g;
-    while (true) {
-        const markerMatch = markerRegex.exec(text);
-        if (markerMatch === null) break;
-
-        let cursor = markerMatch.index + markerMatch[0].length;
-        while (cursor < text.length && /\s/.test(text[cursor])) cursor++;
-        if (text[cursor] !== '{') continue;
-
-        const jsonFragment = extractBalancedJson(text, cursor);
-        const candidate = parseJsonSafely(jsonFragment);
-        if (isSearchResultsObject(candidate)) return candidate;
-
-        const nestedSearchResults = findSearchResultsInNode(candidate);
-        if (nestedSearchResults) return nestedSearchResults;
-    }
-
-    return null;
-};
-
-const collectFlightImages = (flightText, imageMap) => {
-    if (typeof flightText !== 'string' || !flightText) return;
-
-    // Current Mobile.de pages keep image props in the Flight component tree,
-    // while searchResults.listings only contains numImages. Each listing
-    // component has its listingId followed by its primary image and thumbnails.
-    const listingRegex = /"listingId":(\d+)[\s\S]*?(?="listingId":\d+|$)/g;
-    let listingMatch = listingRegex.exec(flightText);
-    while (listingMatch !== null) {
-        const listingId = listingMatch[1];
-        const listingBlock = listingMatch[0];
-        const urls = imageMap.get(listingId) || [];
-        // Top/base cards use image-large and image-thumbnail-*; standard cards
-        // use image without a suffix. These are all emitted by the search page.
-        const imageRegex = /"src":"([^"]+)"\s*,\s*"testId":"(?:top|base|tic)-result-listing-\d+-image(?:-([^"]+))?"/g;
-        let imageMatch = imageRegex.exec(listingBlock);
-
-        while (imageMatch !== null) {
-            const kind = imageMatch[2] || 'image';
-            const rule = kind === 'large' || kind === 'image' ? 'mo-1024' : 'mo-200';
-            const imageUrl = toImageUrl(imageMatch[1], rule);
-            if (imageUrl && !urls.includes(imageUrl)) urls.push(imageUrl);
-            imageMatch = imageRegex.exec(listingBlock);
-        }
-
-        if (urls.length) imageMap.set(listingId, urls);
-        listingMatch = listingRegex.exec(flightText);
-    }
-};
-
-const addFlightImagesToSearchResults = (searchResults, imageMap) => {
-    if (!imageMap?.size || !Array.isArray(searchResults?.items)) return searchResults;
-
-    const items = searchResults.items.map((item) => {
-        const imageUrls = imageMap.get(String(item?.id));
-        if (!imageUrls?.length) return item;
-
-        return {
-            ...item,
-            previewImage: {
-                ...(item.previewImage || {}),
-                src: imageUrls[0],
-            },
-            previewThumbnails: imageUrls.slice(1).map((src) => ({ src })),
-        };
-    });
-
-    return { ...searchResults, items };
-};
-
-const extractSearchResultsFromFlightPayload = (body) => {
-    const flightMarker = 'self.__next_f.push(';
-    const imageMap = new Map();
-    let searchResults;
-    let searchIndex = 0;
-    while (true) {
-        const markerIndex = body.indexOf(flightMarker, searchIndex);
-        if (markerIndex < 0) break;
-
-        const payloadStart = body.indexOf('[', markerIndex + flightMarker.length);
-        if (payloadStart < 0) break;
-
-        const payload = parseJsonSafely(extractBalancedJson(body, payloadStart));
-        const flightText = Array.isArray(payload) && typeof payload[1] === 'string' ? payload[1] : '';
-        collectFlightImages(flightText, imageMap);
-        if (!searchResults) searchResults = extractSearchResultsFromText(flightText);
-
-        searchIndex = payloadStart + 1;
-    }
-
-    if (!searchResults) return null;
-    const normalizedSearchResults = normalizeSearchResults(searchResults);
-    return {
-        searchResults: addFlightImagesToSearchResults(normalizedSearchResults, imageMap),
-    };
-};
-
-const extractSearchResultsFromStructuredPage = (body) => {
-    if (typeof body !== 'string' || !body.trim() || !body.includes('searchResults')) return null;
-
-    const flightPayload = extractSearchResultsFromFlightPayload(body);
-    if (flightPayload) return flightPayload.searchResults;
-
-    const initialState = extractInitialState(body);
-    const initialStateSearchResults = findSearchResultsInNode(initialState);
-    if (initialStateSearchResults) return normalizeSearchResults(initialStateSearchResults);
-
-    const nextDataMatch = body.match(/<script[^>]*id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i);
-    const nextData = parseJsonSafely(nextDataMatch?.[1]?.trim());
-    const nextDataSearchResults = findSearchResultsInNode(nextData);
-    if (nextDataSearchResults) return normalizeSearchResults(nextDataSearchResults);
-
-    const searchResultsFromBody = extractSearchResultsFromText(body);
-    if (searchResultsFromBody) return normalizeSearchResults(searchResultsFromBody);
-
-    const scriptRegex = /<script\b[^>]*>([\s\S]*?)<\/script>/gi;
-    while (true) {
-        const scriptMatch = scriptRegex.exec(body);
-        if (scriptMatch === null) break;
-
-        const scriptContent = scriptMatch[1]?.trim();
-        if (!scriptContent) continue;
-
-        const scriptFlightPayload = extractSearchResultsFromFlightPayload(scriptContent);
-        if (scriptFlightPayload) return normalizeSearchResults(scriptFlightPayload.searchResults);
-
-        if (scriptContent.startsWith('{') || scriptContent.startsWith('[')) {
-            const parsedScript = parseJsonSafely(scriptContent);
-            const parsedScriptSearchResults = findSearchResultsInNode(parsedScript);
-            if (parsedScriptSearchResults) return normalizeSearchResults(parsedScriptSearchResults);
-            continue;
-        }
-
-        const markers = ['window.__init_state__', 'window.__preloaded_state__', 'window.__next_data__'];
-        const lowerScript = scriptContent.toLowerCase();
-        for (const marker of markers) {
-            const markerIndex = lowerScript.indexOf(marker);
-            if (markerIndex < 0) continue;
-
-            const equalsIndex = scriptContent.indexOf('=', markerIndex);
-            if (equalsIndex < 0) continue;
-
-            let valueStart = equalsIndex + 1;
-            while (valueStart < scriptContent.length && /\s/.test(scriptContent[valueStart])) valueStart++;
-            if (scriptContent[valueStart] !== '{' && scriptContent[valueStart] !== '[') continue;
-
-            const jsonFragment = extractBalancedJson(scriptContent, valueStart);
-            const parsedScript = parseJsonSafely(jsonFragment);
-            const parsedScriptSearchResults = findSearchResultsInNode(parsedScript);
-            if (parsedScriptSearchResults) return normalizeSearchResults(parsedScriptSearchResults);
-        }
-    }
-
-    return null;
-};
-
-const isLikelyBlockedResponse = ({ body, statusCode }) => {
-    const text = typeof body === 'string' ? body.toLowerCase() : '';
-    if (statusCode === 403 || statusCode === 429) return true;
-    if (!text) return false;
-    const markers = [
-        'access denied',
-        'captcha',
-        'verify you are human',
-        'security check',
-        'bot challenge',
-        'too many requests',
-        'sec-if-cpt-container',
-    ];
-    const compactChallengeShell = /<body>\s*<script\b[^>]+\bsrc=["'][^"']+["'][^>]*>\s*<\/script>\s*<\/body>/i.test(
-        text,
-    );
-    return compactChallengeShell || markers.some((marker) => text.includes(marker));
-};
-
-const parseBounds = (value) => {
-    if (!value) return {};
-    const parts = value.split(':');
-    const [minimum, maximum] = parts.length === 2 ? parts : [parts[0], parts[0]];
-    return {
-        minimum: minimum ? Number(minimum) : undefined,
-        maximum: maximum ? Number(maximum) : undefined,
-    };
-};
-
-const getResponseFilterMismatches = ({ items, searchUrl }) => {
-    const filters = getExactSearchFilterParameters(searchUrl);
-    const mismatches = [];
-
-    if (filters.makeId) {
-        const expectedMakeName = getMobileDeMakeName(filters.makeId);
-        const expectedMakeKey = expectedMakeName ? normalizeMakeLookupKey(expectedMakeName) : undefined;
-        const observedMakeKeys = items
-            .map((item) => getLocalizedValue(item?.make))
-            .filter(Boolean)
-            .map((value) => normalizeMakeLookupKey(value));
-        const makeMismatch =
-            expectedMakeKey && observedMakeKeys.length && observedMakeKeys.some((value) => value !== expectedMakeKey);
-        if (makeMismatch) {
-            mismatches.push(`make=${expectedMakeName || filters.makeId}`);
-        }
-    }
-
-    if (filters.country) {
-        const observedCountries = items
-            .map((item) => (typeof item?.attr?.cn === 'string' ? item.attr.cn.trim().toUpperCase() : undefined))
-            .filter(Boolean);
-        if (observedCountries.length && observedCountries.some((value) => value !== filters.country)) {
-            mismatches.push(`country=${filters.country}`);
-        }
-    }
-
-    const yearBounds = parseBounds(filters.fr);
-    if (yearBounds.minimum !== undefined || yearBounds.maximum !== undefined) {
-        const observedYears = items
-            .map((item) =>
-                typeof item?.attr?.fr === 'string' ? maybeInteger(item.attr.fr.split('/').at(-1)) : undefined,
-            )
-            .filter((value) => value !== undefined);
-        const yearMismatch = observedYears.some(
-            (value) =>
-                (yearBounds.minimum !== undefined && value < yearBounds.minimum) ||
-                (yearBounds.maximum !== undefined && value > yearBounds.maximum),
-        );
-        if (yearMismatch) mismatches.push(`year=${filters.fr}`);
-    }
-
-    const priceBounds = parseBounds(filters.price);
-    if (priceBounds.minimum !== undefined || priceBounds.maximum !== undefined) {
-        const observedPrices = items
-            .map((item) => maybeNumber(item?.price?.grossAmount ?? item?.price?.grs?.amount))
-            .filter((value) => value !== undefined);
-        const priceMismatch = observedPrices.some(
-            (value) =>
-                (priceBounds.minimum !== undefined && value < priceBounds.minimum) ||
-                (priceBounds.maximum !== undefined && value > priceBounds.maximum),
-        );
-        if (priceMismatch) mismatches.push(`price=${filters.price}`);
-    }
-
-    return mismatches;
 };
 
 const wrapSearchResultsState = (searchResults) => ({
@@ -723,10 +362,134 @@ const getListingDedupeKey = ({ item, candidateIndex, pageNumber, position }) => 
     return `fallback:${candidateIndex}:${pageNumber}:${position}`;
 };
 
-const toMobileHostUrl = (rawUrl) => {
-    const url = new URL(rawUrl);
-    url.hostname = 'm.mobile.de';
-    return url.toString();
+const parseBounds = (value) => {
+    if (!value) return {};
+    const parts = value.split(':');
+    const [minimum, maximum] = parts.length === 2 ? parts : [parts[0], parts[0]];
+    return {
+        minimum: minimum ? Number(minimum) : undefined,
+        maximum: maximum ? Number(maximum) : undefined,
+    };
+};
+
+const getResponseFilterMismatches = ({ items, searchUrl }) => {
+    const filters = getExactSearchFilterParameters(searchUrl);
+    const mismatches = [];
+
+    if (filters.makeId) {
+        const expectedMakeName = getMobileDeMakeName(filters.makeId);
+        const expectedMakeKey = expectedMakeName ? normalizeMakeLookupKey(expectedMakeName) : undefined;
+        const observedMakeKeys = items
+            .map((item) => getLocalizedValue(item?.make))
+            .filter(Boolean)
+            .map((value) => normalizeMakeLookupKey(value));
+        const makeMismatch =
+            expectedMakeKey && observedMakeKeys.length && observedMakeKeys.some((value) => value !== expectedMakeKey);
+        if (makeMismatch) {
+            mismatches.push(`make=${expectedMakeName || filters.makeId}`);
+        }
+    }
+
+    if (filters.country) {
+        const observedCountries = items
+            .map((item) => (typeof item?.attr?.cn === 'string' ? item.attr.cn.trim().toUpperCase() : undefined))
+            .filter(Boolean);
+        if (observedCountries.length && observedCountries.some((value) => value !== filters.country)) {
+            mismatches.push(`country=${filters.country}`);
+        }
+    }
+
+    const yearBounds = parseBounds(filters.fr);
+    if (yearBounds.minimum !== undefined || yearBounds.maximum !== undefined) {
+        const observedYears = items
+            .map((item) =>
+                typeof item?.attr?.fr === 'string' ? maybeInteger(item.attr.fr.split('/').at(-1)) : undefined,
+            )
+            .filter((value) => value !== undefined);
+        const yearMismatch = observedYears.some(
+            (value) =>
+                (yearBounds.minimum !== undefined && value < yearBounds.minimum) ||
+                (yearBounds.maximum !== undefined && value > yearBounds.maximum),
+        );
+        if (yearMismatch) mismatches.push(`year=${filters.fr}`);
+    }
+
+    const priceBounds = parseBounds(filters.price);
+    if (priceBounds.minimum !== undefined || priceBounds.maximum !== undefined) {
+        const observedPrices = items
+            .map((item) => maybeNumber(item?.price?.grossAmount ?? item?.price?.grs?.amount))
+            .filter((value) => value !== undefined);
+        const priceMismatch = observedPrices.some(
+            (value) =>
+                (priceBounds.minimum !== undefined && value < priceBounds.minimum) ||
+                (priceBounds.maximum !== undefined && value > priceBounds.maximum),
+        );
+        if (priceMismatch) mismatches.push(`price=${filters.price}`);
+    }
+
+    return mismatches;
+};
+
+const buildApiUrl = (searchUrl, pageNumber) => {
+    const apiParams = new URLSearchParams();
+    apiParams.set('url', searchUrl);
+    if (pageNumber > 1) {
+        apiParams.set('pageNumber', String(pageNumber));
+    }
+    return `${MOBILE_DE_API_SEARCH_URL}?${apiParams.toString()}`;
+};
+
+const createImpitClient = (proxyUrl) => {
+    const options = {
+        browser: IMPIT_BROWSER,
+        headers: {
+            'x-mobile-client': MOBILE_DE_CLIENT_HEADER,
+            Accept: 'application/json, text/plain, */*',
+            'Accept-Language': 'de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Accept-Encoding': 'gzip, deflate, br',
+            Connection: 'keep-alive',
+            'Sec-Fetch-Dest': 'empty',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Site': 'same-origin',
+        },
+    };
+    if (proxyUrl) {
+        options.proxyUrl = proxyUrl;
+    }
+    return new Impit(options);
+};
+
+const fetchSearchPage = async ({ searchUrl, pageNumber, proxyConfiguration, sessionPrefix, usesUnblocker }) => {
+    const sessionId = usesUnblocker ? undefined : `${sessionPrefix}_api_${pageNumber}`.replace(/[^\w.~]/g, '_');
+    const proxyUrl = proxyConfiguration ? await proxyConfiguration.newUrl(sessionId) : undefined;
+
+    if (proxyConfiguration && typeof proxyUrl !== 'string') {
+        throw new Error('Proxy configuration did not return a usable request session.');
+    }
+
+    const apiUrl = buildApiUrl(searchUrl, pageNumber);
+    const impit = createImpitClient(proxyUrl);
+
+    log.info(`Fetching via API: ${apiUrl}`);
+
+    const response = await impit.fetch(apiUrl, {
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+
+    const responseBody = await response.text();
+
+    if (!response.ok) {
+        throw new Error(`API request failed with status ${response.status}: ${responseBody.slice(0, 200)}`);
+    }
+
+    let data;
+    try {
+        data = JSON.parse(responseBody);
+    } catch {
+        throw new Error(`API returned non-JSON response (status ${response.status}): ${responseBody.slice(0, 200)}`);
+    }
+
+    return { data, proxyUrl };
 };
 
 const fetchSearchState = async ({
@@ -734,96 +497,92 @@ const fetchSearchState = async ({
     proxyConfiguration,
     maxAttempts,
     sessionPrefix,
-    sessionState = {},
     usesUnblocker = false,
 }) => {
-    const targets = [
-        { mode: 'structured-page-mobile-ios', url: toMobileHostUrl(searchUrl) },
-        { mode: 'structured-page-canonical-ios', url: searchUrl },
-    ].filter((target, index, allTargets) => allTargets.findIndex((candidate) => candidate.url === target.url) === index);
-
     let lastError;
     let lastStatusCode;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        let attemptWasBlocked = false;
-        let blockedError;
-        let { client: impit, proxyUrl } = sessionState;
+        const remainingRunTimeMs = getRemainingRunTimeMs();
+        if (remainingRunTimeMs <= RUN_TIMEOUT_BUFFER_MS) throw makeRunTimeoutError();
 
-        if (!impit || attempt > 1) {
-            const sessionId = usesUnblocker
-                ? undefined
-                : `${sessionPrefix}_attempt_${attempt}`.replace(/[^\w.~]/g, '_');
-            proxyUrl = proxyConfiguration ? await proxyConfiguration.newUrl(sessionId) : undefined;
-            if (proxyConfiguration && typeof proxyUrl !== 'string') {
-                throw new Error('Proxy configuration did not return a usable request session.');
-            }
-            impit = proxyUrl
-                ? new Impit({ browser: STRUCTURED_PAGE_BROWSER, proxyUrl })
-                : new Impit({ browser: STRUCTURED_PAGE_BROWSER });
+        try {
+            log.info(`Fetching search results via API (attempt ${attempt}/${maxAttempts})...`);
+            const { data } = await fetchSearchPage({
+                searchUrl,
+                pageNumber: 1,
+                proxyConfiguration,
+                sessionPrefix,
+                usesUnblocker,
+            });
 
-            if (proxyUrl) {
-                log.info(
-                    `Impit request session ready | groups=${getProxyGroups(proxyConfiguration).join(',') || 'automatic'} | country=${getProxyCountry(proxyConfiguration) || 'automatic'} | session=${sessionId ? 'yes' : 'no'}`,
-                );
-            } else {
-                log.info('Impit request session ready | direct connection');
-            }
-        }
-
-        for (const target of targets) {
-            try {
-                const remainingRunTimeMs = getRemainingRunTimeMs();
-                if (remainingRunTimeMs <= RUN_TIMEOUT_BUFFER_MS) throw makeRunTimeoutError();
-
-                const requestTimeoutMs = Math.max(1, Math.min(45000, remainingRunTimeMs - RUN_TIMEOUT_BUFFER_MS));
-                const response = await impit.fetch(target.url, {
-                    signal: AbortSignal.timeout(requestTimeoutMs),
-                });
-                const responseBody = await response.text();
-                lastStatusCode = response.status;
-
-                if (isLikelyBlockedResponse({ body: responseBody, statusCode: response.status })) {
-                    attemptWasBlocked = true;
-                    blockedError = new Error(
-                        `Blocked/challenge response on ${target.mode} (attempt ${attempt}/${maxAttempts}, status ${response.status}).`,
-                    );
-                    blockedError.isBlocked = true;
-                    lastError = blockedError;
-                    continue;
+            const searchResults = data?.searchResults;
+            if (!searchResults || !isSearchResultsObject(searchResults)) {
+                lastError = new Error('API response does not contain valid search results.');
+                lastStatusCode = 200;
+                if (attempt < maxAttempts) {
+                    await sleep(calculateBackoffMs(attempt, 200));
                 }
+                continue;
+            }
 
-                assertSearchUrlFiltersPreserved({ requestedUrl: searchUrl, actualUrl: response.url || target.url });
-                const searchResults = extractSearchResultsFromStructuredPage(responseBody);
-                if (searchResults && Array.isArray(searchResults.items)) {
-                    return {
-                        state: wrapSearchResultsState(searchResults),
-                        mode: target.mode,
-                        sessionState: { client: impit, proxyUrl },
-                    };
-                }
+            const normalizedSearchResults = normalizeSearchResults(searchResults);
+            return {
+                state: wrapSearchResultsState(normalizedSearchResults),
+                mode: 'consumer BFF API via impit',
+            };
+        } catch (error) {
+            if (error?.code === 'ACTOR_TIMEOUT_APPROACHING') throw error;
 
-                const contentType = String(response.headers.get('content-type') || '').toLowerCase();
-                lastError = new Error(
-                    `No structured search results on ${target.mode} (attempt ${attempt}/${maxAttempts}, status ${response.status}${contentType ? `, ${contentType}` : ''}).`,
-                );
-            } catch (error) {
-                if (error?.code === 'ACTOR_TIMEOUT_APPROACHING') throw error;
-                lastError = error;
-                lastStatusCode = undefined;
+            lastError = error;
+            lastStatusCode = error?.message?.match(/status (\d+)/)?.[1]
+                ? Number(error.message.match(/status (\d+)/)[1])
+                : undefined;
+
+            log.warning(`API request failed (attempt ${attempt}/${maxAttempts}): ${error.message}`);
+
+            if (attempt < maxAttempts) {
+                await sleep(calculateBackoffMs(attempt, lastStatusCode));
             }
         }
-
-        if (attempt < maxAttempts) {
-            await sleep(calculateBackoffMs(attempt, lastStatusCode, attemptWasBlocked));
-            continue;
-        }
-
-        if (blockedError) throw blockedError;
     }
 
     const safeReason = lastError?.message || (lastStatusCode ? `last HTTP status ${lastStatusCode}` : 'request failed');
-    throw new Error(`Unable to fetch structured search data. ${safeReason}`);
+    throw new Error(`Unable to fetch search results via API. ${safeReason}`);
+};
+
+const fetchSearchPageByNumber = async ({
+    searchUrl,
+    pageNumber,
+    proxyConfiguration,
+    sessionPrefix,
+    usesUnblocker = false,
+}) => {
+    const remainingRunTimeMs = getRemainingRunTimeMs();
+    if (remainingRunTimeMs <= RUN_TIMEOUT_BUFFER_MS) throw makeRunTimeoutError();
+
+    try {
+        const { data } = await fetchSearchPage({
+            searchUrl,
+            pageNumber,
+            proxyConfiguration,
+            sessionPrefix,
+            usesUnblocker,
+        });
+
+        const searchResults = data?.searchResults;
+        if (!searchResults || !isSearchResultsObject(searchResults)) {
+            throw new Error('API response does not contain valid search results.');
+        }
+
+        return {
+            state: wrapSearchResultsState(normalizeSearchResults(searchResults)),
+            mode: 'consumer BFF API via impit',
+        };
+    } catch (error) {
+        if (error?.code === 'ACTOR_TIMEOUT_APPROACHING') throw error;
+        throw error;
+    }
 };
 
 await Actor.main(async () => {
@@ -832,7 +591,6 @@ await Actor.main(async () => {
     const fallbackInput = await loadFallbackInput();
     const hasRuntimeInput = actorInput !== null && actorInput !== undefined;
     const useLocalFallback = !hasRuntimeInput && !Actor.isAtHome();
-    // INPUT.json is a local runner fallback only; never use it for an Apify run.
     const input = useLocalFallback ? fallbackInput : actorInputObject;
     const {
         startUrl,
@@ -851,7 +609,7 @@ await Actor.main(async () => {
     const configuredMaxPages = clampInt(toPositiveInt(maxPagesInput, DEFAULT_MAX_PAGES), 1, MAX_PAGES);
     const minimumPagesForTarget = Math.ceil(resultsWanted / 20);
     const maxPages = Math.min(MAX_PAGES, Math.max(configuredMaxPages, minimumPagesForTarget));
-    const fetchAttempts = 4;
+    const fetchAttempts = 3;
 
     if (maxPages > configuredMaxPages) {
         log.info(
@@ -890,16 +648,13 @@ await Actor.main(async () => {
     };
     const customProxyUrlsConfigured = hasCustomProxyUrls(proxyConfigInput);
     const proxyRequested = isProxyRequested(proxyConfigInput);
-    const shouldIgnoreApifyProxyLocally =
-        !Actor.isAtHome() && proxyRequested && !customProxyUrlsConfigured;
+    const shouldIgnoreApifyProxyLocally = !Actor.isAtHome() && proxyRequested && !customProxyUrlsConfigured;
     const effectiveProxyConfig = shouldIgnoreApifyProxyLocally ? undefined : proxyConfigInput;
 
     if (proxyRequested && shouldIgnoreApifyProxyLocally) {
         log.info('Local run detected | ignoring Apify Proxy settings; using the direct request path.');
     } else if (proxyRequested) {
-        log.info(
-            `Proxy requested | groups=${getProxyGroups(effectiveProxyConfig).join(',') || 'automatic'} | country=${getProxyCountry(effectiveProxyConfig) || 'automatic'} | custom=${customProxyUrlsConfigured ? 'yes' : 'no'}`,
-        );
+        log.info('Proxy enabled for request recovery.');
     } else {
         log.info('Proxy not configured | using the direct request path.');
     }
@@ -907,8 +662,6 @@ await Actor.main(async () => {
     let proxyConfiguration;
     if (effectiveProxyConfig) {
         try {
-            // Keep the actor input unchanged. The SDK accepts both runtime keys
-            // and the apifyProxy* aliases emitted by the Apify input editor.
             proxyConfiguration = await Actor.createProxyConfiguration(effectiveProxyConfig);
         } catch (error) {
             const message = customProxyUrlsConfigured
@@ -953,100 +706,76 @@ await Actor.main(async () => {
         let discoveredTotalPages = Number.POSITIVE_INFINITY;
         const effectiveMaxPages = maxPages;
         let savedByCandidate = 0;
-        const sessionState = {};
         const candidateLabel = `${candidateIndex + 1}/${baseSearchCandidates.length}`;
-        for (let pageNumber = 1; pageNumber <= effectiveMaxPages && pageNumber <= discoveredTotalPages; pageNumber++) {
-            if (totalSaved >= resultsWanted) {
-                stopReason = 'result_target_reached';
-                break;
-            }
-            if (getRemainingRunTimeMs() <= RUN_TIMEOUT_BUFFER_MS) {
+
+        let firstPageState;
+        try {
+            const fetched = await fetchSearchState({
+                searchUrl: candidate.url,
+                proxyConfiguration,
+                maxAttempts: fetchAttempts,
+                sessionPrefix: `mobilede_${candidateIndex + 1}`,
+                usesUnblocker,
+            });
+            firstPageState = fetched.state;
+            log.info(`Source selected | ${fetched.mode}`);
+        } catch (error) {
+            if (error?.code === 'ACTOR_TIMEOUT_APPROACHING') {
                 stopBeforeActorTimeout();
                 stopReason = 'actor_timeout';
                 break;
             }
+            stopReason = 'page_fetch_failed';
+            const warning = `Page fetch failed for candidate ${candidateLabel} page 1 | url=${candidate.url} | ${error.message}`;
+            runWarnings.push(warning);
+            log.warning(warning);
+            log.warning(
+                'Initial page could not be fetched; stopping because no valid listings are available to continue from.',
+            );
+            break;
+        }
 
-            const searchUrl = withPageNumber(candidate.url, pageNumber);
-            let state;
-            try {
-                const fetched = await fetchSearchState({
-                    searchUrl,
-                    proxyConfiguration,
-                    maxAttempts: fetchAttempts,
-                    sessionPrefix: `mobilede_${candidateIndex + 1}`,
-                    sessionState,
-                    usesUnblocker,
-                });
+        const searchResults = firstPageState?.search?.srp?.data?.searchResults || {};
+        const reportedPageNumber = maybeInteger(searchResults.pageNumber);
+        if (reportedPageNumber !== undefined && reportedPageNumber !== 1) {
+            throw new Error(
+                `Structured response page mismatch: requested page 1, received page ${reportedPageNumber}.`,
+            );
+        }
+        const rawItems = Array.isArray(searchResults.items) ? searchResults.items : [];
+        const items = collectListingsFromNodes(rawItems);
+        const { searchId } = searchResults;
+        const responseFilterMismatches = getResponseFilterMismatches({ items, searchUrl: candidate.url });
+        if (responseFilterMismatches.length) {
+            throw new Error(
+                `Structured response does not match the exact search filters: ${responseFilterMismatches.join(', ')}.`,
+            );
+        }
 
-                state = fetched.state;
-                sessionState.client = fetched.sessionState.client;
-                sessionState.proxyUrl = fetched.sessionState.proxyUrl;
-                if (pageNumber === 1) log.info(`Source selected | ${fetched.mode}`);
-            } catch (error) {
-                if (error?.code === 'ACTOR_TIMEOUT_APPROACHING') {
-                    stopBeforeActorTimeout();
-                    stopReason = 'actor_timeout';
-                    break;
-                }
-                sessionState.client = undefined;
-                sessionState.proxyUrl = undefined;
-                stopReason = 'page_fetch_failed';
-                const warning = `Page fetch failed for candidate ${candidateLabel} page ${pageNumber} | url=${searchUrl} | ${error.message}`;
-                runWarnings.push(warning);
-                log.warning(warning);
-                if (totalSaved === 0) {
-                    log.warning(
-                        'Initial page could not be fetched; stopping because no valid listings are available to continue from.',
-                    );
-                    break;
-                }
-                await flushOutputBatch(true);
-                log.warning(
-                    `Stopping pagination after page ${pageNumber} failed; continuing would skip listings from the failed page.`,
-                );
-                break;
-            }
+        const exactFilters = getExactSearchFilterParameters(candidate.url);
+        const verifiedFilters = [
+            exactFilters.ms && `ms=${exactFilters.ms}`,
+            exactFilters.gn && `gn=${exactFilters.gn}`,
+            exactFilters.fr && `fr=${exactFilters.fr}`,
+            exactFilters.price && `p=${exactFilters.price}`,
+            exactFilters.country && `cn=${exactFilters.country}`,
+        ]
+            .filter(Boolean)
+            .join('&');
+        log.info(`Filter response verified | ${verifiedFilters || 'no optional filters'}`);
 
-            const searchResults = state?.search?.srp?.data?.searchResults || {};
-            const reportedPageNumber = maybeInteger(searchResults.pageNumber);
-            if (reportedPageNumber !== undefined && reportedPageNumber !== pageNumber) {
-                throw new Error(
-                    `Structured response page mismatch: requested page ${pageNumber}, received page ${reportedPageNumber}.`,
-                );
-            }
-            const rawItems = Array.isArray(searchResults.items) ? searchResults.items : [];
-            const items = collectListingsFromNodes(rawItems);
-            const { searchId } = searchResults;
-            const responseFilterMismatches = getResponseFilterMismatches({ items, searchUrl });
-            if (responseFilterMismatches.length) {
-                throw new Error(
-                    `Structured response does not match the exact search filters: ${responseFilterMismatches.join(', ')}.`,
-                );
-            }
-            if (pageNumber === 1) {
-                const exactFilters = getExactSearchFilterParameters(searchUrl);
-                const verifiedFilters = [
-                    exactFilters.ms && `ms=${exactFilters.ms}`,
-                    exactFilters.gn && `gn=${exactFilters.gn}`,
-                    exactFilters.fr && `fr=${exactFilters.fr}`,
-                    exactFilters.price && `p=${exactFilters.price}`,
-                    exactFilters.country && `cn=${exactFilters.country}`,
-                ]
-                    .filter(Boolean)
-                    .join('&');
-                log.info(`Filter response verified | ${verifiedFilters || 'no optional filters'}`);
-            }
-
-            discoveredTotalPages = toPositiveInt(searchResults.numPages, discoveredTotalPages);
-            if (!items.length) {
-                const warning = `No listings parsed for candidate ${candidateLabel} page ${pageNumber}; switching strategy if available.`;
-                runWarnings.push(warning);
-                log.warning(warning);
-                if (searchResults.hasNextPage !== false) continue;
+        discoveredTotalPages = toPositiveInt(searchResults.numPages, discoveredTotalPages);
+        if (!items.length) {
+            const warning = `No listings parsed for candidate ${candidateLabel} page 1; switching strategy if available.`;
+            runWarnings.push(warning);
+            log.warning(warning);
+            if (searchResults.hasNextPage !== false) {
+                pagesFetched++;
+            } else {
                 stopReason = 'no_more_pages';
                 break;
             }
-
+        } else {
             pagesFetched++;
             const pageBatch = [];
             for (const item of items) {
@@ -1055,7 +784,7 @@ await Actor.main(async () => {
                 const dedupeKey = getListingDedupeKey({
                     item,
                     candidateIndex,
-                    pageNumber,
+                    pageNumber: 1,
                     position: pageBatch.length,
                 });
                 if (seenIds.has(dedupeKey)) {
@@ -1066,7 +795,7 @@ await Actor.main(async () => {
                 try {
                     const mapped = mapSearchItem({
                         item,
-                        pageNumber,
+                        pageNumber: 1,
                         searchId,
                     });
 
@@ -1098,6 +827,133 @@ await Actor.main(async () => {
                 stopReason = 'no_more_pages';
                 break;
             }
+        }
+
+        for (let pageNumber = 2; pageNumber <= effectiveMaxPages && pageNumber <= discoveredTotalPages; pageNumber++) {
+            if (totalSaved >= resultsWanted) {
+                stopReason = 'result_target_reached';
+                break;
+            }
+            if (getRemainingRunTimeMs() <= RUN_TIMEOUT_BUFFER_MS) {
+                stopBeforeActorTimeout();
+                stopReason = 'actor_timeout';
+                break;
+            }
+
+            const searchUrl = withPageNumber(candidate.url, pageNumber);
+            let state;
+            try {
+                const fetched = await fetchSearchPageByNumber({
+                    searchUrl: candidate.url,
+                    pageNumber,
+                    proxyConfiguration,
+                    sessionPrefix: `mobilede_${candidateIndex + 1}`,
+                    usesUnblocker,
+                });
+                state = fetched.state;
+            } catch (error) {
+                if (error?.code === 'ACTOR_TIMEOUT_APPROACHING') {
+                    stopBeforeActorTimeout();
+                    stopReason = 'actor_timeout';
+                    break;
+                }
+                stopReason = 'page_fetch_failed';
+                const warning = `Page fetch failed for candidate ${candidateLabel} page ${pageNumber} | url=${searchUrl} | ${error.message}`;
+                runWarnings.push(warning);
+                log.warning(warning);
+                if (totalSaved === 0) {
+                    log.warning(
+                        'Initial page could not be fetched; stopping because no valid listings are available to continue from.',
+                    );
+                    break;
+                }
+                await flushOutputBatch(true);
+                log.warning(
+                    `Stopping pagination after page ${pageNumber} failed; continuing would skip listings from the failed page.`,
+                );
+                break;
+            }
+
+            const pageSearchResults = state?.search?.srp?.data?.searchResults || {};
+            const pageReportedNumber = maybeInteger(pageSearchResults.pageNumber);
+            if (pageReportedNumber !== undefined && pageReportedNumber !== pageNumber) {
+                throw new Error(
+                    `Structured response page mismatch: requested page ${pageNumber}, received page ${pageReportedNumber}.`,
+                );
+            }
+            const pageRawItems = Array.isArray(pageSearchResults.items) ? pageSearchResults.items : [];
+            const pageItems = collectListingsFromNodes(pageRawItems);
+            const pageSearchId = pageSearchResults.searchId;
+            const pageResponseFilterMismatches = getResponseFilterMismatches({ items: pageItems, searchUrl });
+            if (pageResponseFilterMismatches.length) {
+                throw new Error(
+                    `Structured response does not match the exact search filters: ${pageResponseFilterMismatches.join(', ')}.`,
+                );
+            }
+
+            discoveredTotalPages = toPositiveInt(pageSearchResults.numPages, discoveredTotalPages);
+            if (!pageItems.length) {
+                const warning = `No listings parsed for candidate ${candidateLabel} page ${pageNumber}; switching strategy if available.`;
+                runWarnings.push(warning);
+                log.warning(warning);
+                if (pageSearchResults.hasNextPage !== false) continue;
+                stopReason = 'no_more_pages';
+                break;
+            }
+
+            pagesFetched++;
+            const pageBatch = [];
+            for (const item of pageItems) {
+                if (totalSaved + pageBatch.length >= resultsWanted) break;
+
+                const dedupeKey = getListingDedupeKey({
+                    item,
+                    candidateIndex,
+                    pageNumber,
+                    position: pageBatch.length,
+                });
+                if (seenIds.has(dedupeKey)) {
+                    duplicateCount++;
+                    continue;
+                }
+
+                try {
+                    const mapped = mapSearchItem({
+                        item,
+                        pageNumber,
+                        searchId: pageSearchId,
+                    });
+
+                    if (!isValidMappedRecord(mapped)) {
+                        invalidRecordCount++;
+                        log.warning(`Skipping invalid record (key: ${dedupeKey})`);
+                        continue;
+                    }
+
+                    seenIds.add(dedupeKey);
+                    pageBatch.push(mapped);
+                } catch (error) {
+                    log.warning(`Skipping item due to mapping error (key: ${dedupeKey}): ${error.message}`);
+                }
+            }
+
+            if (pageBatch.length) {
+                outputBatch.push(...pageBatch);
+                totalSaved += pageBatch.length;
+                savedByCandidate += pageBatch.length;
+                await flushOutputBatch();
+            }
+
+            if (totalSaved >= resultsWanted) {
+                stopReason = 'result_target_reached';
+                break;
+            }
+            if (pageSearchResults.hasNextPage === false) {
+                stopReason = 'no_more_pages';
+                break;
+            }
+
+            await sleep(500 + Math.floor(Math.random() * 1000));
         }
 
         if (

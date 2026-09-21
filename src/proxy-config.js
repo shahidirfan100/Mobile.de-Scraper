@@ -20,5 +20,3 @@ export const hasCustomProxyUrls = (proxyConfig) =>
 
 export const isProxyRequested = (proxyConfig) =>
     Boolean(proxyConfig && typeof proxyConfig === 'object' && proxyConfig.useApifyProxy !== false);
-
-
