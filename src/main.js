@@ -76,6 +76,16 @@ const makeRunTimeoutError = () => {
     return error;
 };
 
+const getErrorStatusCode = (error) => {
+    const match = typeof error?.message === 'string' ? error.message.match(/status (\d+)/) : null;
+    return match ? Number(match[1]) : undefined;
+};
+
+const isRetryableStatus = (statusCode) => {
+    if (statusCode === undefined) return true;
+    return statusCode === 429 || (statusCode >= 500 && statusCode < 600);
+};
+
 const calculateBackoffMs = (attempt, statusCode) => {
     if (statusCode === 429) return Math.min(3000 * attempt, 30000);
     if (statusCode === 400 || statusCode === 403 || (statusCode >= 500 && statusCode < 600)) {
@@ -430,13 +440,28 @@ const getResponseFilterMismatches = ({ items, searchUrl }) => {
     return mismatches;
 };
 
-const buildApiUrl = (searchUrl, pageNumber) => {
+const buildApiUrl = (searchUrl) => {
     const apiParams = new URLSearchParams();
     apiParams.set('url', searchUrl);
-    if (pageNumber > 1) {
-        apiParams.set('pageNumber', String(pageNumber));
-    }
     return `${MOBILE_DE_API_SEARCH_URL}?${apiParams.toString()}`;
+};
+
+const fetchSearchPage = async ({ client, searchUrl }) => {
+    const response = await client.fetch(buildApiUrl(searchUrl), {
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+
+    const responseBody = await response.text();
+
+    if (!response.ok) {
+        throw new Error(`API request failed with status ${response.status}: ${responseBody.slice(0, 200)}`);
+    }
+
+    try {
+        return JSON.parse(responseBody);
+    } catch {
+        throw new Error(`API returned non-JSON response (status ${response.status}): ${responseBody.slice(0, 200)}`);
+    }
 };
 
 const createImpitClient = (proxyUrl) => {
@@ -446,8 +471,6 @@ const createImpitClient = (proxyUrl) => {
             'x-mobile-client': MOBILE_DE_CLIENT_HEADER,
             Accept: 'application/json, text/plain, */*',
             'Accept-Language': 'de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7',
-            'Accept-Encoding': 'gzip, deflate, br',
-            Connection: 'keep-alive',
             'Sec-Fetch-Dest': 'empty',
             'Sec-Fetch-Mode': 'cors',
             'Sec-Fetch-Site': 'same-origin',
@@ -459,35 +482,24 @@ const createImpitClient = (proxyUrl) => {
     return new Impit(options);
 };
 
-const fetchSearchPage = async ({ searchUrl, pageNumber, proxyConfiguration, sessionPrefix, usesUnblocker }) => {
-    const sessionId = usesUnblocker ? undefined : `${sessionPrefix}_api_${pageNumber}`.replace(/[^\w.~]/g, '_');
-    const proxyUrl = proxyConfiguration ? await proxyConfiguration.newUrl(sessionId) : undefined;
+let activeImpitClient;
+let activeSessionCounter = 0;
 
-    if (proxyConfiguration && typeof proxyUrl !== 'string') {
-        throw new Error('Proxy configuration did not return a usable request session.');
+const getSearchClient = async ({ proxyConfiguration, sessionPrefix, usesUnblocker, rotate = false }) => {
+    if (activeImpitClient && !rotate) return activeImpitClient;
+
+    let proxyUrl;
+    if (proxyConfiguration) {
+        activeSessionCounter += 1;
+        const sessionId = usesUnblocker ? undefined : `${sessionPrefix}_s${activeSessionCounter}`;
+        proxyUrl = await proxyConfiguration.newUrl(sessionId);
+        if (typeof proxyUrl !== 'string') {
+            throw new Error('Proxy configuration did not return a usable request session.');
+        }
     }
 
-    const apiUrl = buildApiUrl(searchUrl, pageNumber);
-    const impit = createImpitClient(proxyUrl);
-
-    const response = await impit.fetch(apiUrl, {
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    });
-
-    const responseBody = await response.text();
-
-    if (!response.ok) {
-        throw new Error(`API request failed with status ${response.status}: ${responseBody.slice(0, 200)}`);
-    }
-
-    let data;
-    try {
-        data = JSON.parse(responseBody);
-    } catch {
-        throw new Error(`API returned non-JSON response (status ${response.status}): ${responseBody.slice(0, 200)}`);
-    }
-
-    return { data, proxyUrl };
+    activeImpitClient = createImpitClient(proxyUrl);
+    return activeImpitClient;
 };
 
 const fetchSearchState = async ({
@@ -501,87 +513,41 @@ const fetchSearchState = async ({
     let lastStatusCode;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        const remainingRunTimeMs = getRemainingRunTimeMs();
-        if (remainingRunTimeMs <= RUN_TIMEOUT_BUFFER_MS) throw makeRunTimeoutError();
+        if (getRemainingRunTimeMs() <= RUN_TIMEOUT_BUFFER_MS) throw makeRunTimeoutError();
 
         try {
-            const { data } = await fetchSearchPage({
-                searchUrl,
-                pageNumber: 1,
+            const client = await getSearchClient({
                 proxyConfiguration,
                 sessionPrefix,
                 usesUnblocker,
+                rotate: attempt > 1,
             });
+            const data = await fetchSearchPage({ client, searchUrl });
 
             const searchResults = data?.searchResults;
             if (!searchResults || !isSearchResultsObject(searchResults)) {
-                lastError = new Error('API response does not contain valid search results.');
-                lastStatusCode = 200;
-                if (attempt < maxAttempts) {
-                    await sleep(calculateBackoffMs(attempt, 200));
-                }
-                continue;
+                throw new Error('API response does not contain valid search results.');
             }
 
-            const normalizedSearchResults = normalizeSearchResults(searchResults);
             return {
-                state: wrapSearchResultsState(normalizedSearchResults),
+                state: wrapSearchResultsState(normalizeSearchResults(searchResults)),
                 mode: 'consumer BFF API via impit',
             };
         } catch (error) {
             if (error?.code === 'ACTOR_TIMEOUT_APPROACHING') throw error;
 
             lastError = error;
-            lastStatusCode = error?.message?.match(/status (\d+)/)?.[1]
-                ? Number(error.message.match(/status (\d+)/)[1])
-                : undefined;
+            lastStatusCode = getErrorStatusCode(error);
 
-            if (attempt >= maxAttempts) {
-                log.warning(`API request failed after ${maxAttempts} attempts: ${error.message}`);
-            }
+            if (attempt >= maxAttempts || !isRetryableStatus(lastStatusCode)) break;
 
-            if (attempt < maxAttempts) {
-                await sleep(calculateBackoffMs(attempt, lastStatusCode));
-            }
+            log.debug(`Fetch retry ${attempt}/${maxAttempts} | ${error.message}`);
+            await sleep(calculateBackoffMs(attempt, lastStatusCode));
         }
     }
 
     const safeReason = lastError?.message || (lastStatusCode ? `last HTTP status ${lastStatusCode}` : 'request failed');
     throw new Error(`Unable to fetch search results via API. ${safeReason}`);
-};
-
-const fetchSearchPageByNumber = async ({
-    searchUrl,
-    pageNumber,
-    proxyConfiguration,
-    sessionPrefix,
-    usesUnblocker = false,
-}) => {
-    const remainingRunTimeMs = getRemainingRunTimeMs();
-    if (remainingRunTimeMs <= RUN_TIMEOUT_BUFFER_MS) throw makeRunTimeoutError();
-
-    try {
-        const { data } = await fetchSearchPage({
-            searchUrl,
-            pageNumber,
-            proxyConfiguration,
-            sessionPrefix,
-            usesUnblocker,
-        });
-
-        const searchResults = data?.searchResults;
-        if (!searchResults || !isSearchResultsObject(searchResults)) {
-            throw new Error('API response does not contain valid search results.');
-        }
-
-        return {
-            state: wrapSearchResultsState(normalizeSearchResults(searchResults)),
-            mode: 'consumer BFF API via impit',
-        };
-    } catch (error) {
-        if (error?.code === 'ACTOR_TIMEOUT_APPROACHING') throw error;
-        throw error;
-    }
 };
 
 await Actor.main(async () => {
@@ -611,9 +577,7 @@ await Actor.main(async () => {
     const fetchAttempts = 3;
 
     if (maxPages > configuredMaxPages) {
-        log.info(
-            `Pagination cap expanded from ${configuredMaxPages} to ${maxPages} pages for results_wanted=${resultsWanted}.`,
-        );
+        log.debug(`Pagination cap expanded from ${configuredMaxPages} to ${maxPages} pages.`);
     }
     let baseSearchCandidates;
     try {
@@ -650,9 +614,9 @@ await Actor.main(async () => {
     const effectiveProxyConfig = shouldIgnoreApifyProxyLocally ? undefined : proxyConfigInput;
 
     if (proxyRequested && shouldIgnoreApifyProxyLocally) {
-        log.info('Local run detected | using direct connection.');
+        log.debug('Local run detected | using direct connection.');
     } else if (proxyRequested) {
-        log.info('Proxy enabled.');
+        log.debug('Proxy enabled.');
     }
 
     let proxyConfiguration;
@@ -719,14 +683,14 @@ await Actor.main(async () => {
                 break;
             }
             stopReason = 'page_fetch_failed';
-            const warning = `Page fetch failed for candidate ${candidateLabel} page 1 | url=${candidate.url} | ${error.message}`;
+            const warning = `Page fetch failed for candidate ${candidateLabel} page 1: ${error.message}`;
             runWarnings.push(warning);
             log.warning(warning);
             break;
         }
 
         const searchResults = firstPageState?.search?.srp?.data?.searchResults || {};
-        const reportedPageNumber = maybeInteger(searchResults.pageNumber);
+        const reportedPageNumber = maybeInteger(searchResults.page ?? searchResults.pageNumber);
         if (reportedPageNumber !== undefined && reportedPageNumber !== 1) {
             throw new Error(
                 `Structured response page mismatch: requested page 1, received page ${reportedPageNumber}.`,
@@ -818,10 +782,10 @@ await Actor.main(async () => {
             const searchUrl = withPageNumber(candidate.url, pageNumber);
             let state;
             try {
-                const fetched = await fetchSearchPageByNumber({
-                    searchUrl: candidate.url,
-                    pageNumber,
+                const fetched = await fetchSearchState({
+                    searchUrl,
                     proxyConfiguration,
+                    maxAttempts: fetchAttempts,
                     sessionPrefix: `mobilede_${candidateIndex + 1}`,
                     usesUnblocker,
                 });
@@ -833,7 +797,7 @@ await Actor.main(async () => {
                     break;
                 }
                 stopReason = 'page_fetch_failed';
-                const warning = `Page fetch failed for candidate ${candidateLabel} page ${pageNumber} | url=${searchUrl} | ${error.message}`;
+                const warning = `Page fetch failed for candidate ${candidateLabel} page ${pageNumber}: ${error.message}`;
                 runWarnings.push(warning);
                 log.warning(warning);
                 if (totalSaved === 0) break;
@@ -842,7 +806,7 @@ await Actor.main(async () => {
             }
 
             const pageSearchResults = state?.search?.srp?.data?.searchResults || {};
-            const pageReportedNumber = maybeInteger(pageSearchResults.pageNumber);
+            const pageReportedNumber = maybeInteger(pageSearchResults.page ?? pageSearchResults.pageNumber);
             if (pageReportedNumber !== undefined && pageReportedNumber !== pageNumber) {
                 throw new Error(
                     `Structured response page mismatch: requested page ${pageNumber}, received page ${pageReportedNumber}.`,

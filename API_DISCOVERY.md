@@ -8,10 +8,23 @@ The actor now uses mobile.de's **consumer BFF JSON API** instead of scraping the
 - **Method:** `GET`
 - **Auth:** None
 - **Required Header:** `x-mobile-client: de.mobile.consumer-webapp`
-- **Request format:** Query parameter `url` containing the search URL, optional `pageNumber` parameter
+- **Request format:** Single query parameter `url` containing the full search URL, including `pageNumber`, for example `url=<urlencoded https://suchen.mobile.de/...&pageNumber=3>`
 - **Response format:** JSON with `searchResults.{numResultsTotal, page, numPages, hasNextPage, items}`
 - **Proxy:** Optional; residential proxy recommended for high-volume scraping
-- **Pagination:** `pageNumber=<n>` parameter; mobile.de caps deep pagination at ~50 pages (~1300 listings) per search
+- **Pagination:** `pageNumber` **inside** the encoded `url` value; mobile.de caps deep pagination at 50 pages per search
+
+### Pagination (critical contract)
+
+The BFF reads the page from the `pageNumber` query string **inside** the encoded `url` parameter. A separate top-level `pageNumber` parameter is silently ignored:
+
+| Request                                                     | `searchResults.page` | Result                                    |
+| ----------------------------------------------------------- | -------------------- | ----------------------------------------- |
+| `?url=<base>&pageNumber=3` (separate param)                 | `1`                  | Returns page 1 again; wrong/duplicate data |
+| `?url=<base with &pageNumber=3>` (inside `url`)             | `3`                  | Returns page 3 correctly                  |
+
+Always append `pageNumber` to the search URL first, then URL-encode the whole thing as `url`. A response whose `searchResults.page` does not match the requested page indicates the contract broke and must be treated as a failed page.
+
+Page size is fixed at roughly 20-26 items per page (ad slots vary); `size`, `pageSize`, and `limit` parameters do not change it. `numPages` is capped at 50.
 
 ### Key discovery
 
@@ -25,14 +38,23 @@ Without this header, the API returns `400 {"errors":[{"key":"400","args":["Missi
 
 ### TLS profile
 
-The BFF is not JA3-sensitive. The following profiles all work:
+The BFF is not JA3-sensitive. The following profiles all returned valid JSON on repeated direct requests:
 
+- `chrome` (latest)
 - `chrome124`
 - `chrome131`
-- `safari17_0`
-- `edge101`
+- `chrome136`
+- `chrome142`
+- `ios18`
+- `firefox`
 
-The header, not the fingerprint, is what unlocks the endpoint.
+The `x-mobile-client` header, not the fingerprint, is what unlocks the endpoint. The actor uses `chrome124` because it is documented and stable.
+
+### Reliability notes
+
+- Reuse one `impit` client (and one proxy session) across all pages of a search instead of creating a client per page. Connection reuse and a sticky residential IP reduce intermittent failures.
+- Rotate the proxy session only when a page exhausts its bounded retry budget; then retry that page on the fresh session.
+- Apply the same bounded retry to every page, not only page 1.
 
 ### Why this approach works
 
