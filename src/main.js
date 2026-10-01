@@ -470,8 +470,6 @@ const fetchSearchPage = async ({ searchUrl, pageNumber, proxyConfiguration, sess
     const apiUrl = buildApiUrl(searchUrl, pageNumber);
     const impit = createImpitClient(proxyUrl);
 
-    log.info(`Fetching via API: ${apiUrl}`);
-
     const response = await impit.fetch(apiUrl, {
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
@@ -507,7 +505,6 @@ const fetchSearchState = async ({
         if (remainingRunTimeMs <= RUN_TIMEOUT_BUFFER_MS) throw makeRunTimeoutError();
 
         try {
-            log.info(`Fetching search results via API (attempt ${attempt}/${maxAttempts})...`);
             const { data } = await fetchSearchPage({
                 searchUrl,
                 pageNumber: 1,
@@ -539,7 +536,9 @@ const fetchSearchState = async ({
                 ? Number(error.message.match(/status (\d+)/)[1])
                 : undefined;
 
-            log.warning(`API request failed (attempt ${attempt}/${maxAttempts}): ${error.message}`);
+            if (attempt >= maxAttempts) {
+                log.warning(`API request failed after ${maxAttempts} attempts: ${error.message}`);
+            }
 
             if (attempt < maxAttempts) {
                 await sleep(calculateBackoffMs(attempt, lastStatusCode));
@@ -637,7 +636,6 @@ await Actor.main(async () => {
     }
 
     const runWarnings = [];
-    log.info(`Filtered search URL ready | ${baseSearchCandidates[0].url}`);
     let stoppedForTimeout = false;
     const stopBeforeActorTimeout = () => {
         if (stoppedForTimeout) return;
@@ -652,11 +650,9 @@ await Actor.main(async () => {
     const effectiveProxyConfig = shouldIgnoreApifyProxyLocally ? undefined : proxyConfigInput;
 
     if (proxyRequested && shouldIgnoreApifyProxyLocally) {
-        log.info('Local run detected | ignoring Apify Proxy settings; using the direct request path.');
+        log.info('Local run detected | using direct connection.');
     } else if (proxyRequested) {
-        log.info('Proxy enabled for request recovery.');
-    } else {
-        log.info('Proxy not configured | using the direct request path.');
+        log.info('Proxy enabled.');
     }
 
     let proxyConfiguration;
@@ -692,7 +688,6 @@ await Actor.main(async () => {
             const batch = outputBatch.slice(0, batchSize);
             await Actor.pushData(batch);
             outputBatch.splice(0, batch.length);
-            log.info(`Saved batch | count=${batch.length} | total=${totalSaved}/${resultsWanted}`);
         }
     };
 
@@ -705,7 +700,6 @@ await Actor.main(async () => {
         const candidate = baseSearchCandidates[candidateIndex];
         let discoveredTotalPages = Number.POSITIVE_INFINITY;
         const effectiveMaxPages = maxPages;
-        let savedByCandidate = 0;
         const candidateLabel = `${candidateIndex + 1}/${baseSearchCandidates.length}`;
 
         let firstPageState;
@@ -718,7 +712,6 @@ await Actor.main(async () => {
                 usesUnblocker,
             });
             firstPageState = fetched.state;
-            log.info(`Source selected | ${fetched.mode}`);
         } catch (error) {
             if (error?.code === 'ACTOR_TIMEOUT_APPROACHING') {
                 stopBeforeActorTimeout();
@@ -729,9 +722,6 @@ await Actor.main(async () => {
             const warning = `Page fetch failed for candidate ${candidateLabel} page 1 | url=${candidate.url} | ${error.message}`;
             runWarnings.push(warning);
             log.warning(warning);
-            log.warning(
-                'Initial page could not be fetched; stopping because no valid listings are available to continue from.',
-            );
             break;
         }
 
@@ -752,23 +742,10 @@ await Actor.main(async () => {
             );
         }
 
-        const exactFilters = getExactSearchFilterParameters(candidate.url);
-        const verifiedFilters = [
-            exactFilters.ms && `ms=${exactFilters.ms}`,
-            exactFilters.gn && `gn=${exactFilters.gn}`,
-            exactFilters.fr && `fr=${exactFilters.fr}`,
-            exactFilters.price && `p=${exactFilters.price}`,
-            exactFilters.country && `cn=${exactFilters.country}`,
-        ]
-            .filter(Boolean)
-            .join('&');
-        log.info(`Filter response verified | ${verifiedFilters || 'no optional filters'}`);
-
         discoveredTotalPages = toPositiveInt(searchResults.numPages, discoveredTotalPages);
         if (!items.length) {
-            const warning = `No listings parsed for candidate ${candidateLabel} page 1; switching strategy if available.`;
+            const warning = `No listings parsed for candidate ${candidateLabel} page 1.`;
             runWarnings.push(warning);
-            log.warning(warning);
             if (searchResults.hasNextPage !== false) {
                 pagesFetched++;
             } else {
@@ -801,21 +778,19 @@ await Actor.main(async () => {
 
                     if (!isValidMappedRecord(mapped)) {
                         invalidRecordCount++;
-                        log.warning(`Skipping invalid record (key: ${dedupeKey})`);
                         continue;
                     }
 
                     seenIds.add(dedupeKey);
                     pageBatch.push(mapped);
-                } catch (error) {
-                    log.warning(`Skipping item due to mapping error (key: ${dedupeKey}): ${error.message}`);
+                } catch {
+                    invalidRecordCount++;
                 }
             }
 
             if (pageBatch.length) {
                 outputBatch.push(...pageBatch);
                 totalSaved += pageBatch.length;
-                savedByCandidate += pageBatch.length;
                 await flushOutputBatch();
             }
 
@@ -861,16 +836,8 @@ await Actor.main(async () => {
                 const warning = `Page fetch failed for candidate ${candidateLabel} page ${pageNumber} | url=${searchUrl} | ${error.message}`;
                 runWarnings.push(warning);
                 log.warning(warning);
-                if (totalSaved === 0) {
-                    log.warning(
-                        'Initial page could not be fetched; stopping because no valid listings are available to continue from.',
-                    );
-                    break;
-                }
+                if (totalSaved === 0) break;
                 await flushOutputBatch(true);
-                log.warning(
-                    `Stopping pagination after page ${pageNumber} failed; continuing would skip listings from the failed page.`,
-                );
                 break;
             }
 
@@ -893,9 +860,8 @@ await Actor.main(async () => {
 
             discoveredTotalPages = toPositiveInt(pageSearchResults.numPages, discoveredTotalPages);
             if (!pageItems.length) {
-                const warning = `No listings parsed for candidate ${candidateLabel} page ${pageNumber}; switching strategy if available.`;
+                const warning = `No listings parsed for candidate ${candidateLabel} page ${pageNumber}.`;
                 runWarnings.push(warning);
-                log.warning(warning);
                 if (pageSearchResults.hasNextPage !== false) continue;
                 stopReason = 'no_more_pages';
                 break;
@@ -926,21 +892,19 @@ await Actor.main(async () => {
 
                     if (!isValidMappedRecord(mapped)) {
                         invalidRecordCount++;
-                        log.warning(`Skipping invalid record (key: ${dedupeKey})`);
                         continue;
                     }
 
                     seenIds.add(dedupeKey);
                     pageBatch.push(mapped);
-                } catch (error) {
-                    log.warning(`Skipping item due to mapping error (key: ${dedupeKey}): ${error.message}`);
+                } catch {
+                    invalidRecordCount++;
                 }
             }
 
             if (pageBatch.length) {
                 outputBatch.push(...pageBatch);
                 totalSaved += pageBatch.length;
-                savedByCandidate += pageBatch.length;
                 await flushOutputBatch();
             }
 
@@ -965,12 +929,6 @@ await Actor.main(async () => {
         }
         if (stoppedForTimeout) break;
         if (stopReason !== 'not_started') break;
-
-        if (savedByCandidate === 0 && candidateIndex < baseSearchCandidates.length - 1) {
-            log.warning(
-                `Candidate ${candidateLabel} produced no listings. Trying the same filtered URL on the next host.`,
-            );
-        }
     }
 
     await flushOutputBatch(true);
@@ -1000,13 +958,6 @@ await Actor.main(async () => {
                 resultsWanted,
                 maxPages,
             }),
-        );
-        return;
-    }
-
-    if (runWarnings.length) {
-        log.warning(
-            `Completed with ${runWarnings.length} warning(s). Last warning: ${runWarnings[runWarnings.length - 1]}`,
         );
     }
 });
